@@ -1,0 +1,12 @@
+{
+  "id": "/",
+  "name": "Softline · Поддержка",
+  "short_name": "Softline",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F0F2F6",
+  "theme_color": "#A50F2D",
+  "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]
+}
