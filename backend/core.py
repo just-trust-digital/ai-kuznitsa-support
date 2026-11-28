@@ -269,25 +269,37 @@ class Store:
     @staticmethod
     def _index_display(db):
         # Choose one representative per product before interleaving the catalog.
-        db.execute("DELETE FROM catalog_display")
-        db.execute("""
-            INSERT INTO catalog_display(offer_id)
-            WITH products AS (
-                SELECT COALESCE(MIN(CASE WHEN json_extract(body,'$.available') THEN id END), MIN(id)) AS sku,
-                       COUNT(*) AS variants, MAX(json_extract(body,'$.available')) AS buyable
-                FROM offers GROUP BY COALESCE('g:' || json_extract(body,'$.group_id'), 's:' || id)
-            ), cards AS (
-                SELECT sku, CASE WHEN NOT buyable THEN 2 WHEN variants > 1 THEN 1 ELSE 0 END AS kind,
-                       COALESCE(NULLIF(json_extract(body,'$.vendor'),''),category,'') AS brand
-                FROM products JOIN offers ON id=sku
-            ), brands AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY kind,brand ORDER BY sku) AS brand_rank FROM cards
-            ), ranked AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY kind ORDER BY brand_rank,sku)-1 AS n FROM brands
-            )
-            SELECT sku FROM ranked ORDER BY
-                CASE kind WHEN 0 THEN (n/2)*4+(n%2)*2 WHEN 1 THEN n*4+1 ELSE n*4+3 END, sku
+        products = {}
+        rows = db.execute("""
+            SELECT id, json_extract(body,'$.group_id'), json_extract(body,'$.available'),
+                   COALESCE(NULLIF(json_extract(body,'$.vendor'),''),category,'')
+            FROM offers ORDER BY id
         """)
+        for sku, group, available, brand in rows:
+            key = (group is None, sku if group is None else group)
+            old = products.get(key)
+            if old is None:
+                products[key] = (sku, available, brand, False)
+            elif available and not old[1]:
+                products[key] = (sku, available, brand, True)
+            elif not old[3]:
+                products[key] = (*old[:3], True)
+
+        kinds = [[], [], []]
+        brands = {}
+        for sku, available, brand, grouped in sorted(products.values()):
+            kind = 2 if not available else int(grouped)
+            brand_rank = brands.get((kind, brand), 0)
+            kinds[kind].append((brand_rank, sku))
+            brands[kind, brand] = brand_rank + 1
+        order = []
+        for kind, entries in enumerate(kinds):
+            for n, (_, sku) in enumerate(sorted(entries)):
+                place = 4 * (n // 2) + 2 * (n % 2) if kind == 0 else 4 * n + (1 if kind == 1 else 3)
+                order.append((place, sku))
+        db.execute("DELETE FROM catalog_display")
+        db.executemany("INSERT INTO catalog_display(offer_id) VALUES (?)",
+                       ((sku,) for _, sku in sorted(order)))
 
     @staticmethod
     def _check(role, scope):
