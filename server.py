@@ -4,6 +4,7 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import socket
 import secrets
 import sys
@@ -11,7 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from backend.runtime import build_store, start_forum
+from backend.runtime import build_store, start_telegram
+from backend.telegram_notifications import MANAGER_ROLES
 from backend.customer import guest_id, request_customer
 from backend.documents import PROFILES
 
@@ -134,6 +136,9 @@ class Handler(BaseHTTPRequestHandler):
         subject = guest_id(self.headers.get("Authorization", "")[7:]) if identity == "guest" else (
             identity if identity == "personal" else "buyer1" if identity == "buyer" else None)
         jury_visitor = guest_id(self.headers.get("X-Stand-Guest")) if identity == "jury" else None
+        notifications = getattr(self.server.store, "manager_notifications", None)
+        browser_session = self.headers.get("X-Stand-Session", "")
+        valid_session = re.fullmatch(r"[0-9a-f-]{36}", browser_session) is not None
         context = request_customer.set(subject)
         try:
             if method == "GET" and url.path in {"/api/state", "/api/chat"}:
@@ -159,6 +164,8 @@ class Handler(BaseHTTPRequestHandler):
                                           if buyer == "personal" else {"type": "company", "company_name": PROFILES[buyer]})
                     if identity == "jury":
                         result["client_profiles"] = PROFILES
+                if url.path == "/api/state" and role in MANAGER_ROLES and notifications and valid_session:
+                    result["telegram"] = notifications.session_action(browser_session, scope, role, "status")
             elif method == "POST" and url.path == "/api/action":
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 1 <= length <= 1_450_000:
@@ -173,6 +180,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise PermissionError()
                 if not isinstance(action, str) or not isinstance(payload, dict):
                     raise ValueError()
+                if action in {"telegram_connect", "telegram_disconnect", "telegram_logout"}:
+                    operation = action.removeprefix("telegram_")
+                    if not valid_session or (role not in MANAGER_ROLES and not
+                            (operation == "logout" and identity == "jury")):
+                        raise PermissionError()
+                    if not notifications:
+                        return self.json_response(503, {"error": "Уведомления в Telegram недоступны."})
+                    result = notifications.session_action(browser_session, scope, role, operation, payload.get("code"))
+                    return self.json_response(400 if "error" in result else 200, result)
                 if action == "continue_guest_chat":
                     visitor = guest_id(payload.get("guest_token"))
                     if identity not in {"buyer", "personal"} or not visitor:
@@ -256,13 +272,12 @@ def main():
         server.credentials = credentials
         server.store = build_store(args.runtime / "stand.sqlite3", feed if feed.is_file() else None,
                                    corpus if corpus.is_file() else None, args.runtime)
-        stop_forum = start_forum(server.store, args.runtime)
+        stop_telegram = start_telegram(server.store, args.runtime)
         print(f"Support stand: http://{args.bind}:{args.port}/?utm_source=jtd_dev", flush=True)
         try:
             server.serve_forever()
         finally:
-            if stop_forum:
-                stop_forum()
+            stop_telegram()
 
 
 if __name__ == "__main__":

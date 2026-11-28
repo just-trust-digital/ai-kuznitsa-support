@@ -103,33 +103,42 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, 'Redirect blocked', headers, fp)
 
 
-def post(url, payload, token=None):
+def post(url, payload, token=None, *, proxy=None):
     headers = {'Content-Type': 'application/json'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
     request = urllib.request.Request(url, json.dumps(payload).encode(), headers)
     # Local requests must not inherit a proxy and leak conversation data.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()) if urlsplit(url).hostname in ('127.0.0.1', 'localhost', '::1') else urllib.request.build_opener(NoRedirect())
+    if urlsplit(url).hostname in ('127.0.0.1', 'localhost', '::1'):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    elif proxy:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({'https': proxy}), NoRedirect())
+    else:
+        opener = urllib.request.build_opener(NoRedirect())
     with opener.open(request, timeout=45) as response:
         return json.load(response)
 
 
-def jev_proxy():
+def windows_https_proxy(service):
     """Use the enabled Windows primary proxy; never fall back to direct."""
     import winreg
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Internet Settings') as key:
         if winreg.QueryValueEx(key, 'ProxyEnable')[0] != 1:
-            raise RuntimeError('Jev proxy is not enabled')
+            raise RuntimeError(f'{service} proxy is not enabled')
         value = winreg.QueryValueEx(key, 'ProxyServer')[0]
     if '=' in value:
         value = dict(part.split('=', 1) for part in value.split(';') if '=' in part).get('https', '')
     if not value:
-        raise RuntimeError('Jev HTTPS proxy is not configured')
+        raise RuntimeError(f'{service} HTTPS proxy is not configured')
     url = value if '://' in value else 'http://' + value
     parts = urlsplit(url)
     if parts.scheme != 'http' or parts.hostname not in ('127.0.0.1', 'localhost', '::1') or not parts.port:
-        raise RuntimeError('Jev requires the configured local HTTP proxy')
+        raise RuntimeError(f'{service} requires the configured local HTTP proxy')
     return url
+
+
+def jev_proxy():
+    return windows_https_proxy('Jev')
 
 
 def post_jev(url, payload, token=None):

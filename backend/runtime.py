@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .core import Store
 from .integrations import IntegrationEngine, HybridEngine
-from .telegram_bridge import TelegramBridge, PollingWorker
+from .telegram_bridge import TelegramBridge
+from .telegram_notifications import ManagerNotifications
 
 
 def build_store(db, feed, corpus, runtime_dir):
@@ -31,62 +32,107 @@ def build_store(db, feed, corpus, runtime_dir):
     return store
 
 
-def start_forum(store, runtime_dir):
+def start_telegram(store, runtime_dir):
     config = getattr(store, 'runtime_config', {}).get('telegram', {})
-    if not config.get('chat_id') or not os.environ.get('SUPPORT_TELEGRAM_BOT_TOKEN'):
+    token = os.environ.get('SUPPORT_TELEGRAM_BOT_TOKEN')
+    if not token:
         return lambda: None
-    # Only explicitly synthetic jury workspaces may enter Telegram.
+    forum = config.get('chat_id')
     scope = config.get('scope', '')
-    if not scope.startswith('jury') or config.get('synthetic_only') is not True:
+    if forum and (not scope.startswith('jury') or config.get('synthetic_only') is not True):
         raise ValueError('Telegram requires an explicitly synthetic jury workspace')
     roles = {int(k): v for k, v in config.get('operators', {}).items()}
-    if not roles or any(v not in ('manager1', 'manager2') for v in roles.values()):
+    if forum and (not roles or any(v not in ('manager1', 'manager2') for v in roles.values())):
         raise ValueError('Telegram user-to-manager mapping is required')
-    token = os.environ['SUPPORT_TELEGRAM_BOT_TOKEN']
-    from .integrations import post
+    from .integrations import post, windows_https_proxy
+    proxy = None
+    if os.name == 'nt':
+        try:
+            proxy = windows_https_proxy('Telegram')
+        except (OSError, RuntimeError):
+            pass
+
     def call(method, payload):
         try:
-            result = post('https://api.telegram.org/bot' + token + '/' + method, payload)
+            result = post('https://api.telegram.org/bot' + token + '/' + method, payload, proxy=proxy)
             if not result.get('ok'):
                 raise ValueError('rejected')
             return result['result']
         except Exception:
             raise RuntimeError('Telegram request failed') from None
-    bridge = TelegramBridge(str(Path(runtime_dir) / 'forum.sqlite'), config['chat_id'], roles, call, None)
-    worker = PollingWorker(bridge, store, scope, 'manager1')
+    bridge = TelegramBridge(str(Path(runtime_dir) / 'forum.sqlite'), forum, roles, call, None) if forum else None
+    notifications = ManagerNotifications(store.storage, call)
+    store.manager_notifications = notifications
     stop = threading.Event()
-    bridge.db.execute('CREATE TABLE IF NOT EXISTS published(id TEXT PRIMARY KEY, state TEXT)')
+    if bridge:
+        bridge.db.execute('CREATE TABLE IF NOT EXISTS worker_cursor(id INTEGER PRIMARY KEY, offset INTEGER)')
+        bridge.db.execute('CREATE TABLE IF NOT EXISTS published(id TEXT PRIMARY KEY, state TEXT)')
+
+    def publish_forum():
+        for role in ('manager1', 'manager2'):
+            for dialog in store.snapshot(role, scope)['dialogs']:
+                if dialog.get('status') != 'assigned' or dialog.get('assignment') != role:
+                    continue
+                key = dialog['id']
+                notice = key + '/' + role
+                with bridge.lock:
+                    if bridge.db.execute('SELECT 1 FROM published WHERE id=?', (notice,)).fetchone():
+                        continue
+                    bridge.db.execute('INSERT INTO published VALUES (?,?)', (notice, 'pending'))
+                    bridge.db.commit()
+                    reason = dialog['route']['reason']
+                    manager_name = 'Менеджер 1' if role == 'manager1' else 'Менеджер 2'
+                    bridge.publish(key, manager_name + '. ' + reason + '. Ответ можно отправить в этой теме.')
+                    bridge.db.execute('UPDATE published SET state=? WHERE id=?', ('sent', notice))
+                    bridge.db.commit()
+
     def run():
+        private_bot = None
+        reported_failure = False
         while not stop.is_set():
             try:
-                for role in ('manager1', 'manager2'):
-                    for dialog in store.snapshot(role, scope)['dialogs']:
-                        if dialog.get('status') != 'assigned' or dialog.get('assignment') != role:
-                            continue
-                        key = dialog['id']
-                        notice = key + '/' + role
-                        with bridge.lock:
-                            if bridge.db.execute('SELECT 1 FROM published WHERE id=?', (notice,)).fetchone():
-                                continue
-                            bridge.db.execute('INSERT INTO published VALUES (?,?)', (notice, 'pending'))
-                            bridge.db.commit()
-                            # No original messages or personal data leave this installation.
-                            reason = dialog['route']['reason']
-                            manager_name = 'Менеджер 1' if role == 'manager1' else 'Менеджер 2'
-                            bridge.publish(key, manager_name + '. ' + reason + '. Ответ можно отправить в этой теме.')
-                            bridge.db.execute('UPDATE published SET state=? WHERE id=?', ('sent', notice))
-                            bridge.db.commit()
-                row = bridge.db.execute('SELECT offset FROM worker_cursor WHERE id=1').fetchone()
-                for update in call('getUpdates', {'offset': row[0] if row else 0, 'timeout': 20, 'allowed_updates': ['message']}):
+                if private_bot is None:
+                    is_test_bot = call('getMe', {}).get('username', '').lower() == 'jtd_test_bot'
+                    if is_test_bot and call('getWebhookInfo', {}).get('url'):
+                        print('Telegram polling requires a bot without an active webhook', flush=True)
+                        return
+                    private_bot = is_test_bot
+                    if not private_bot and not bridge:
+                        print('Telegram notifications require @jtd_test_bot', flush=True)
+                        return
+                offset = notifications.offset()
+                if bridge:
+                    row = bridge.db.execute('SELECT offset FROM worker_cursor WHERE id=1').fetchone()
+                    offset = max(offset, row[0] if row else 0)
+                updates = call('getUpdates', {'offset': offset, 'timeout': 3 if private_bot else 20,
+                                              'allowed_updates': ['message']})
+                notifications.ready = private_bot
+                for update in updates:
+                    if stop.is_set():
+                        return
                     message = update.get('message', {})
                     role = roles.get(message.get('from', {}).get('id'))
-                    if role:
+                    if private_bot:
+                        notifications.receive(message, update['update_id'])
+                    if bridge and role:
                         bridge.deliver = lambda dialog, text, request, role=role: store.act(role, 'reply', {'dialog_id': dialog, 'text': text, 'request_id': request}, scope)
                         bridge.receive(update)
-                    bridge.db.execute('INSERT OR REPLACE INTO worker_cursor VALUES (1,?)', (update['update_id'] + 1,))
-                    bridge.db.commit()
-            except Exception:
+                    if bridge:
+                        bridge.db.execute('INSERT OR REPLACE INTO worker_cursor VALUES (1,?)', (update['update_id'] + 1,))
+                        bridge.db.commit()
+                    if private_bot:
+                        notifications.offset(update['update_id'] + 1)
+                if private_bot:
+                    notifications.flush()
+                if bridge:
+                    publish_forum()
+                reported_failure = False
+            except Exception as exc:
+                notifications.ready = False
+                if not reported_failure:
+                    print(f'Telegram worker unavailable: {type(exc).__name__}', flush=True)
+                    reported_failure = True
                 stop.wait(5)
-    thread = threading.Thread(target=run, daemon=True, name='support-forum')
+    thread = threading.Thread(target=run, daemon=True, name='support-telegram')
     thread.start()
     return stop.set

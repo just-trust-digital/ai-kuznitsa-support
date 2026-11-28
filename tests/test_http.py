@@ -2,11 +2,14 @@ import http.client
 import json
 import tempfile
 import threading
+import time
 import unittest
+import uuid
 from pathlib import Path
 
 from backend.core import Store
 from backend.runtime import build_store
+from backend.telegram_notifications import ManagerNotifications
 from server import Handler, SupportServer, access_file
 
 
@@ -26,13 +29,15 @@ class TestStandAccess(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-    def call(self, path, role=None, body=None, *, jury_guest=None):
+    def call(self, path, role=None, body=None, *, jury_guest=None, browser_session=None):
         client = http.client.HTTPConnection(*self.server.server_address, timeout=4)
         headers = {"Content-Type": "application/json"}
         if role:
             headers["Authorization"] = "Bearer " + self.tokens[role]
         if jury_guest:
             headers["X-Stand-Guest"] = jury_guest
+        if browser_session:
+            headers["X-Stand-Session"] = browser_session
         client.request("GET" if body is None else "POST", path,
                        json.dumps(body) if body is not None else None, headers)
         response = client.getresponse()
@@ -40,6 +45,43 @@ class TestStandAccess(unittest.TestCase):
         client.close()
         self.assertEqual("no-store", cache)
         return status, content
+
+    def test_telegram_pairing_and_handoff_follow_manager_session(self):
+        sent = []
+        store = self.server.store
+        notifications = ManagerNotifications(store.storage, lambda method, payload: sent.append(payload))
+        store.manager_notifications = notifications
+        notifications.ready = True
+        session, other = str(uuid.uuid4()), str(uuid.uuid4())
+        message = {"chat": {"id": 701, "type": "private"}, "from": {"id": 701},
+                   "text": "/start", "date": int(time.time())}
+        notifications.receive({**message, "chat": {"id": 701, "type": "group"}}, 1)
+        self.assertEqual(sent, [])
+        notifications.receive(message, 2)
+        code = sent.pop()["text"].splitlines()[2]
+        connect = {"action": "telegram_connect", "payload": {"code": code}, "role": "manager1"}
+        self.assertEqual(self.call("/api/action", "buyer", connect, browser_session=session)[0], 403)
+        self.assertEqual(self.call("/api/action", "manager1", connect)[0], 403)
+        self.assertEqual(self.call("/api/action", "manager1", connect, browser_session=session)[0], 200)
+        self.assertEqual(self.call("/api/action", "manager1", connect, browser_session=other)[0], 400)
+        status, data = self.call("/api/state?role=manager1", "manager1", browser_session=other)
+        self.assertIsNone(json.loads(data)["telegram"]["expires"])
+        handoff = {"action": "handoff", "payload": {"request_id": "once"}}
+        self.assertEqual(self.call("/api/action", "jury", handoff)[0], 200)
+        notifications.flush()
+        self.assertEqual(sent, [])
+        for _ in range(2):
+            self.assertEqual(self.call("/api/action", "buyer", handoff)[0], 200)
+        notifications.flush()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["chat_id"], 701)
+        self.assertIn("Вам назначено новое обращение", sent[0]["text"])
+        handoff["payload"]["request_id"] = "second"
+        self.assertEqual(self.call("/api/action", "buyer", handoff)[0], 200)
+        self.assertEqual(self.call("/api/action", "manager1", {"action": "telegram_logout"},
+                                   browser_session=session)[0], 200)
+        notifications.flush()
+        self.assertEqual(len(sent), 1)
 
     def test_minimum_of_one_compound_product(self):
         name = "Kaspersky Security для Microsoft Office 365 лицензия на 1 год. Количество почтовых ящиков"

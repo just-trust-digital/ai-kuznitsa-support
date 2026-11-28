@@ -553,7 +553,12 @@ class Store:
                     raise ValueError("Этот номер запроса уже использован с другими данными")
                 self._check_cached_access(role, action, state, payload, existing["result"])
                 return self._result_view(role, existing["result"])
+            notifications = getattr(self, "manager_notifications", None)
+            assigned_before = notifications.assignments(state) if notifications else None
             result = self._act(db, state, role, action, payload, scope, model)
+            if notifications:
+                new_assignments = notifications.assignments(state) - assigned_before
+                notifications.enqueue(db, scope, (manager for _, manager in new_assignments))
             if request:
                 state["requests"][key] = dict(fingerprint=fingerprint,
                                               result=json.loads(json.dumps(result, ensure_ascii=False)))

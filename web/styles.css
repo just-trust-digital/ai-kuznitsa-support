@@ -21,6 +21,9 @@ h2 {font-size:21px;margin:0 0 12px}
 h3 {margin:0 0 6px}
 small,.muted {color:var(--muted)}
 .grid {display:grid;grid-template-columns:minmax(210px,1fr) minmax(0,2.2fr);gap:20px;align-items:start}
+.telegram-settings {margin-block:14px}
+.telegram-settings summary {cursor:pointer;min-height:44px;align-content:center}
+.telegram-settings input {width:100%;font-variant-numeric:tabular-nums}
 .panel {background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:22px;min-width:0}
 .panel h2 {padding-bottom:12px;border-bottom:1px solid var(--line)}
 .order {width:100%;text-align:left;display:block;margin-top:10px}

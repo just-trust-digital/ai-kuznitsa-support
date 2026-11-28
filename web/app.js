@@ -12,6 +12,8 @@ const safeUrl = value => {
   catch { return ''; }
 };
 let token = sessionStorage.getItem('softline-token') ?? '';
+let telegramSession = sessionStorage.getItem('softline-telegram-session');
+let telegramEnabled = false;
 let session, role, state, dialogId, result, tab, busy = false, samplePage = 0, sampleQuery = '', selectedOffer = '';
 let errorText = '';
 let catalogSearch;
@@ -114,6 +116,7 @@ async function request(path, data) {
   try {
     response = await fetch(path, {method:data?'POST':'GET',cache:'no-store',headers:{
       Authorization:'Bearer '+token, ...(data?{'Content-Type':'application/json'}:{}),
+      ...(telegramSession ? {'X-Stand-Session':telegramSession} : {}),
       ...(session?.role==='jury' && (data?.role==='guest' || new URL(path,location.href).searchParams.get('role')==='guest')
         ? {'X-Stand-Guest':guestToken()} : {})
     },body:data?JSON.stringify(data):undefined,signal:AbortSignal.timeout(25000)});
@@ -121,6 +124,9 @@ async function request(path, data) {
   const payload = await response.json().catch(()=>({}));
   if (response.status===401) {
     sessionStorage.removeItem('softline-token');
+    sessionStorage.removeItem('softline-telegram-session');
+    telegramSession = undefined;
+    telegramEnabled = false;
     token = '';
     session = undefined;
     state=role=result=dialogId=tab=undefined;
@@ -133,7 +139,16 @@ async function request(path, data) {
   }
   return payload;
 }
-async function loadState() { state = await request('/api/state?role='+encodeURIComponent(role)); }
+async function roleState(nextRole) {
+  if ((nextRole==='manager1' || nextRole==='manager2') && !telegramSession) {
+    telegramSession = crypto.randomUUID();
+    sessionStorage.setItem('softline-telegram-session',telegramSession);
+  }
+  const next = await request('/api/state?role='+encodeURIComponent(nextRole));
+  telegramEnabled ||= Boolean(next.telegram);
+  return next;
+}
+async function loadState() { state = await roleState(role); }
 async function loadCatalog(query, page) {
   const data = await request('/api/action',{role,action:'search',payload:{query,by_product:true,page,limit:8}});
   selectedOffer='';
@@ -524,6 +539,7 @@ function queuePage() {
   const manager = state.managers?.[role] ?? list(state.managers).find(m=>(m.id ?? m.role)===role);
   const learning=training || role==='developer';
   let queue = manager && !learning ? '<p>'+(manager.available?'На линии':'Не на линии')+'</p>'+button(manager.available?'Уйти с линии':'Выйти на линию','availability',!manager.available):'';
+  if (!learning && state.telegram) queue += telegramSettings();
   queue += rows(dialogs,x=>'<button type="button" class="order" data-do="dialog" data-value="'+attr(x.id)+'" aria-pressed="'+(d?.id===x.id)+'"><b>'+escape(selectDialogLabel(x))+'</b><small>'+escape(label(x.status))+' · '+escape(label(x.assignment ?? 'Без назначения'))+'</small></button>','В очереди пока нет обращений.');
   if (!learning) queue += list(state.queue).filter(x=>!dialogs.some(y=>y.id===x.id)).map(x=>item('В общей очереди',
     '<p>'+escape(x.id)+' · '+escape(x.route?.reason ?? x.reason)+'</p>'+button('Взять обращение','claim',x.id))).join('');
@@ -545,6 +561,20 @@ function queuePage() {
       '<details><summary>Разметка чата</summary>'+annotationForm('moderate','dialog_id',d)+'</details>';
   }
   return '<div class="grid">'+panel('Очередь чатов',queue)+panel('Переписка',detail)+'</div>';
+}
+function telegramSettings() {
+  const {available, expires} = state.telegram;
+  const open = app.querySelector('.telegram-settings')?.dataset.role===role &&
+    app.querySelector('.telegram-settings').open;
+  const until = expires && new Intl.DateTimeFormat('ru-RU',{dateStyle:'short',timeStyle:'short',timeZone:'Europe/Moscow'})
+    .format(new Date(expires*1000));
+  const body = expires
+    ? '<p role="status">Подключено до '+escape(until)+' МСК.</p>'+button('Отключить','telegram-disconnect','')
+    : available ? '<p>Отправьте /start в личном чате с <a href="https://t.me/jtd_test_bot" target="_blank" rel="noreferrer">@jtd_test_bot</a>. Код действует 5 минут.</p>'+
+        form('telegram_connect',field('Код из Telegram','code','','inputmode="numeric" pattern="[0-9]{10}" maxlength="10" required autocomplete="off"')+submit('Подключить'))
+      : '<p>Бот сейчас недоступен. Обновите обращения позже.</p>';
+  return '<details class="telegram-settings" data-role="'+attr(role)+'"'+(open?' open':'')+'>'+
+    '<summary>Уведомления в Telegram</summary>'+body+'</details>';
 }
 function routeDetails(route) {
   if (typeof route==='string') return '<p>'+escape(route)+'</p>';
@@ -706,6 +736,10 @@ app.addEventListener('submit', event => {
   if (message && !p.text.trim() && !fileDraft) return;
   run(async () => {
     if (action==='login') { await signIn(p.token.trim()); return; }
+    if (action==='telegram_connect') {
+      state.telegram = await request('/api/action',{role,action,payload:{code:p.code}});
+      return;
+    }
     if (action==='filter') { sampleQuery=p.query.trim(); samplePage=0; return; }
     if (action==='message') {
       p.mode=buyerMode;
@@ -749,6 +783,7 @@ app.addEventListener('submit', event => {
       if (action==='message' && messageRole(list(result.dialog?.messages).at(-1) ?? {})==='assistant') notifyMessage();
     }
   }, event.submitter, ()=>{
+    if (action==='telegram_connect') app.querySelector('.telegram-settings summary')?.focus();
     if (action==='search') app.querySelector('.catalog-search input')?.focus();
     app.querySelector('[data-action="'+action+'"] textarea')?.focus();
     const thread=app.querySelector(action==='reply'?'.staff-thread':'.thread');
@@ -872,17 +907,30 @@ document.addEventListener('click', event => {
       case 'end-chat': await act('end_chat',{dialog_id:value}); clearComposer(); chatPane=''; break;
       case 'clear-history': await act('clear_history',{}); clearComposer(); dialogId=undefined; chatPane=''; break;
       case 'logout':
+        if (telegramEnabled || telegramSession && session?.role==='jury') {
+          try {
+            await request('/api/action',{role,action:'telegram_logout'});
+          } catch (error) {
+            if (error.status!==503) throw error;
+          }
+        }
+        sessionStorage.removeItem('softline-telegram-session');
+        telegramSession=undefined;
+        telegramEnabled=false;
         resetWorkspace();
         clientContexts.clear();
         sessionStorage.removeItem('softline-guest-dialog');
         sessionStorage.removeItem('softline-guest');
         sessionStorage.removeItem('softline-token');
         token=''; session=state=role=result=dialogId=tab=undefined; break;
+      case 'telegram-disconnect':
+        state.telegram = await request('/api/action',{role,action:'telegram_disconnect'});
+        break;
       case 'refresh': await loadState(); break;
       case 'role':
         if (value===role) break;
         {
-          const next = await request('/api/state?role='+encodeURIComponent(value));
+          const next = await roleState(value);
           resetWorkspace(); role=value; state=next; result=dialogId=tab=undefined; samplePage=0; sampleQuery=''; selectedOffer='';
         }
         break;
