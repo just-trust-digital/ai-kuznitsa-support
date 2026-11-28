@@ -265,6 +265,9 @@ def main():
     parser.add_argument("--materials", type=Path, default=ROOT / "private" / "support-agent")
     parser.add_argument("--init-access", action="store_true")
     args = parser.parse_args()
+    args.runtime.mkdir(parents=True, exist_ok=True)
+    # Full-feed grouping needs SQLite sort files on read-only container images.
+    os.environ.setdefault("SQLITE_TMPDIR", str(args.runtime.resolve()))
     credentials = access_file(args.access_dir)
     if args.init_access:
         return
