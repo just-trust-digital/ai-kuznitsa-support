@@ -12,6 +12,9 @@ PRIVATE_TEXT = (
     r"(?<!\w)(?:\+?\d[\s()\-]*){10,}(?!\w)",
     r"\b(?:sl|inv|kp)-[\w-]+\b",
     r"(?<=\bключ\s)[A-Z0-9-]{10,}\b",
+    r"\b(?:DEMO-LIC|DEMO-KEY)-[A-Z0-9-]+\b",
+    r"\b(?:Bearer\s+|(?:пароль|токен|api[_ -]?key|ключ активации)\s*[:=]\s*)[^\s,;]+",
+    r"\b(?:[A-Z0-9]{5}-){4}[A-Z0-9]{5}\b",
 )
 ELIGIBLE_ROLES = {"assistant", "manager1", "manager2"}
 
@@ -108,7 +111,7 @@ def log_for(state, role):
 
 
 def capture_context(dialog):
-    keys = ("facets", "viewed_offer", "viewed_group", "group_request", "decision", "discount_counteroffer",
+    keys = ("facets", "viewed_offer", "viewed_group", "group_request", "decision", "discount_counteroffer", "purchase_condition",
             "optional_answers", "guided_selection", "search_by_name", "asked_seats", "asked_platform", "clarification_stalled")
     return {key: deepcopy(dialog[key]) for key in keys if key in dialog}
 
@@ -138,21 +141,8 @@ def replay(state, role, dialog_id, message_id, version, answer):
     if "discount_acceptance" in context.get("missing", []):
         staged["discount_counteroffer"] = True
     staged.update(deepcopy(question.get("review_context", {})))
-    # Keep product descriptions and lists of attributes attached to their question.
-    fragments = [part.strip() for part in re.split(
-        r"(?<=[?!])\s+|[,;]\s*(?=(?:а\s+)?(?:как|где|когда|сколько|можно|нужен|дайте)\b)"
-        r"|\s+и\s+(?=(?:как|где|когда|сколько|можно|дадите|подскажите)\b)", question["text"], flags=re.I
-    ) if part.strip()]
-    before = deepcopy(staged) if len(fragments) > 1 else None
     answer(scenario, staged, question)
     steps = trace_steps(staged["messages"][len(history):], question["text"])
-    if len(fragments) > 1 and not any(step["fragment"] != item["question"] for step in steps):
-        for fragment in fragments:
-            trial = deepcopy(before)
-            trial["messages"][-1]["text"] = fragment
-            answer(scenario, trial, dict(question, text=fragment))
-            for step in trace_steps(trial["messages"][len(history):], fragment):
-                steps.append(dict(step, separate=True))
     variants = original_answer.get("review_variants", {})
     model = original_answer.get("model") or {}
     response = staged["messages"][-1]
@@ -161,6 +151,6 @@ def replay(state, role, dialog_id, message_id, version, answer):
     result.update(steps=steps, variants=variants, original_template=original_answer.get("template_id"),
                   model_published=bool(model.get("published")), model_failed=bool(model.get("error")))
     result.update(answer="В этом сценарии запрос требует менеджера." if next_action == "handoff"
-                  else redact(response["text"]),
+                  else "\n".join(dict.fromkeys(step["text"] for step in steps)),
                   source=source_reference(response.get("source")), next_action=next_action, mode="rules")
     return result

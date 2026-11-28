@@ -89,6 +89,9 @@ del {color:#594b52}
 .thread {flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}
 .chat-foot {border-top:1px solid var(--line)}
 .chat-foot textarea {height:48px;resize:none}
+.checkout-heading {display:flex;align-items:start;justify-content:space-between;gap:8px}
+.checkout-heading strong {min-width:0;overflow-wrap:anywhere}
+.chat-foot [data-action="document"] {max-height:32dvh;overflow:auto}
 .login-actions {display:flex;gap:8px}
 .login-actions button {min-width:0}
 .login-actions .primary {flex:1}
@@ -117,7 +120,7 @@ del {color:#594b52}
 .product-art-3 {--cover:#84253e;--cover-wash:#f3e1e6}
 .product-cover {width:min(62%,142px);min-height:76px;display:grid;align-content:end;padding:9px;background:var(--cover);color:white;font-weight:700;line-height:1.15;border-radius:5px;box-shadow:6px 4px white}
 .product-question {position:absolute;top:19px;right:19px;background:white!important}
-.product-question,.product-actions,.product form {z-index:2;position:relative}
+.product-question,.product-actions {z-index:2;position:relative}
 .product .product-question {position:absolute}
 .product-bottom {display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px;margin-top:auto;padding-top:12px}
 .product-bottom strong {font-size:20px}
@@ -207,3 +210,16 @@ body:has(.launcher) .buyer-main {padding-bottom:88px}
 @media(prefers-reduced-motion:reduce){.invite,.handoff{animation:none}}
 
 .mock-data-note{display:block;margin-top:4px;color:#596087;font-size:.81rem}
+.dialog-result {width:min(26rem,calc(100% - 2rem));box-sizing:border-box;max-height:85vh;overflow:auto;border:1px solid #bcc8d3;border-radius:12px;padding:1.5rem;color:#182331;background:white}
+.dialog-result h2 {margin-top:0}
+.dialog-result::backdrop {background:rgb(19 32 46 / 45%)}
+.manager-list h3 {display:flex;align-items:center;gap:.5em;margin:1.1em 0 .45em}
+.manager-list h3 small {font-size:.8em;color:#565e69}
+.manager-ticket {border-inline-start:4px solid #ae6814;overflow-wrap:anywhere}
+.manager-ticket.closed {border-inline-start-color:#26805a}
+.manager-ticket strong {color:#174aa0;background:#e8f1ff;border-radius:4px;padding:2px 5px;display:inline-block}
+.manager-tools {display:flex;align-items:center;flex-wrap:wrap;gap:4px;border-top:1px solid var(--line);margin-top:18px;padding-top:10px}
+.manager-tools span {margin-right:auto}
+.manager-tools .chat-icon {width:44px;min-height:44px;color:#4a5361}
+.manager-tools .enabled {color:#176444;background:#ebf5ef}
+@media (min-width:701px) and (max-width:1000px) {.manager-tools span {flex-basis:100%}}

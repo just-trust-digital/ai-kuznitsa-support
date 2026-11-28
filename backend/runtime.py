@@ -25,7 +25,9 @@ def build_store(db, feed, corpus, runtime_dir):
         hybrid_engine = HybridEngine(
             hybrid['public_catalog'], hybrid.get('kb_urls', []), hybrid['jev_model'],
             hybrid.get('cloud_url'), hybrid.get('cloud_model'), os.environ.get('TYPESAFE_API_KEY'),
-            os.environ.get('SUPPORT_CLOUD_API_KEY'), cloud_generator=generate_public if provider == 'codex' else None)
+            os.environ.get('SUPPORT_CLOUD_API_KEY'), cloud_generator=generate_public if provider == 'codex' else None,
+            clef_account=os.environ['CLOUDFLARE_ACCOUNT_ID'] if hybrid.get('clef') else None,
+            clef_token=os.environ.get('CLOUDFLARE_API_TOKEN'))
     store = Store(db, feed, corpus, engine=engine, hybrid_engine=hybrid_engine)
     store.business_hours = lambda: 9 <= (datetime.now(timezone.utc).hour + 3) % 24 < 19
     store.runtime_config = config

@@ -204,7 +204,9 @@ class Handler(BaseHTTPRequestHandler):
                         request_customer.set(jury_visitor)
                     role = "buyer"
                     if action == "message":
-                        payload["mode"] = "rules"
+                        payload["mode"] = ("hybrid" if getattr(self.server.store, "runtime_config", {})
+                                           .get("hybrid", {}).get("freeform") and payload.get("mode") != "rules"
+                                           else "rules")
                 if action in {"buyer_select", "clear_history"} and identity != "jury":
                     raise PermissionError()
                 if length > 65536 and (action not in {"message", "reply"} or not payload.get("attachment")):
@@ -263,6 +265,9 @@ def main():
     parser.add_argument("--materials", type=Path, default=ROOT / "private" / "support-agent")
     parser.add_argument("--init-access", action="store_true")
     args = parser.parse_args()
+    args.runtime.mkdir(parents=True, exist_ok=True)
+    # Full-feed grouping needs SQLite sort files on read-only container images.
+    os.environ.setdefault("SQLITE_TMPDIR", str(args.runtime.resolve()))
     credentials = access_file(args.access_dir)
     if args.init_access:
         return

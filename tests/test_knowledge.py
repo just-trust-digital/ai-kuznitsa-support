@@ -224,6 +224,27 @@ class KnowledgeParts(unittest.TestCase):
             self.assertEqual(len(replies), 2)
             self.assertTrue(replies[0]['source'].endswith('/delivery_info/'))
 
+    def test_delivery_city_and_key_timing_match_shipping_help(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / 'stand.sqlite')
+            for text in ('Есть ли доставка в Казань?', 'Как быстро придёт ключ?'):
+                dialog = store.act('buyer', 'message', {'text': text, 'mode': 'rules'}, 'shipping-phrases')['dialog']
+                reply = dialog['messages'][-1]
+                self.assertEqual(dialog['decision']['next_action'], 'inform', text)
+                self.assertTrue(reply['source'].endswith('/delivery_info/'), text)
+
+    def test_individual_buyers_get_checkout_help_without_product_demand(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / 'stand.sqlite')
+            for text in ('Продаёте ли программное обеспечение физическим лицам?',
+                         'Я самозанятый, могу купить лицензию?'):
+                dialog = store.act('buyer', 'message', {'text': text, 'mode': 'rules'}, 'individual-buyers')['dialog']
+                reply = dialog['messages'][-1]
+                self.assertEqual(dialog['decision']['intent'], 'checkout', text)
+                self.assertIn('корзину', reply['text'])
+                self.assertNotEqual(reply['text'], 'Укажите название продукта и на сколько пользователей '
+                                                   'или устройств нужна лицензия.')
+
 
 if __name__ == '__main__':
     unittest.main()

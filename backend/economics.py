@@ -35,7 +35,7 @@ def estimate(profile, volume):
     if usage is None:
         missing.append("usage")
     for provider, counters in (usage or {}).items():
-        if provider not in {"jev", "cloud"}:
+        if provider not in {"jev", "clef", "cloud"}:
             continue
         calls = decimal(counters.get("calls"))
         metered = decimal(counters.get("metered_calls"))

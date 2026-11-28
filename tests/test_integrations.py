@@ -41,6 +41,32 @@ if __name__ == '__main__':
     unittest.main()
 
 class HybridTests(unittest.TestCase):
+    def test_clef_checks_route_before_qwen(self):
+        from backend.integrations import HybridEngine
+        calls = []
+        route = {'answers': {'route': {'choice': 'technical', 'probabilities': {'technical': .99}}}}
+        def transport(url, payload, token):
+            calls.append((url, payload, token))
+            if 'typesafe.ai' in url:
+                return route
+            if 'cloudflare.com' in url:
+                return {'result': {'answers': {'route': {'choice': clef_choice, 'probabilities': {clef_choice:.9}}}}}
+            return {'choices': [{'message': {'content': 'Проверено'}}]}
+        engine = HybridEngine({'s': {'name':'Demo', 'secret':'PRIVATE'}}, [], 'jev-latest',
+                              'https://inference-api.nousresearch.com/v1/chat/completions',
+                              'qwen/qwen3.6-35b-a3b', 'j', 'q', transport,
+                              clef_account='a'*32, clef_token='c')
+        clef_choice = 'operator'
+        self.assertFalse(engine.consult('technical','s')['verified_model'])
+        self.assertEqual([c[2] for c in calls], ['j','c'])
+        calls.clear()
+        clef_choice = 'technical'
+        result = engine.consult('technical','s')
+        self.assertTrue(result['verified_model'])
+        self.assertEqual([c[2] for c in calls], ['j','c','q'])
+        self.assertEqual(calls[0][1]['state'], calls[1][1]['state'])
+        self.assertNotIn('PRIVATE', str(calls))
+
     def test_both_cloud_calls_only_allowlisted_fields(self):
         from backend.integrations import HybridEngine
         calls = []
