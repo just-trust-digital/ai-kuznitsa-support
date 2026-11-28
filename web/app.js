@@ -506,6 +506,8 @@ function catalogPage() {
     '<div class="catalog-grid">'+
     rows(catalogOffers(), offer => {
       const grouped=Boolean(offer.group_name);
+      const price=grouped ? (offer.group_price_from>0 ? 'от '+escape(num(offer.group_price_from))+' '+escape(offer.group_price_currency) : '')
+                          : offerPrice(offer,false);
       const id = String(offer.id);
       const url = grouped?'':safeUrl(offer.url);
       const viewed=grouped?context.viewed?.group_name && context.viewed.group_id===offer.group_id:String(context.viewed?.id)===id;
@@ -519,7 +521,7 @@ function catalogPage() {
         iconButton('question','Спросить о товаре','ask-product',id,'product-question')+
         '<div class="product-copy">'+(offer.category?'<p class="product-category">'+escape(offer.category)+'</p>':'')+'<h3>'+escape(name)+'</h3>'+
         (description && description!==offer.name?'<p>'+escape(description)+'</p>':'')+(grouped?'':quantityTerms(offer))+'</div>'+
-        '<div class="product-bottom">'+(grouped?'':'<strong>'+offerPrice(offer,false)+'</strong>')+'<div class="product-actions">'+
+        '<div class="product-bottom">'+(price?'<strong>'+price+'</strong>':'')+'<div class="product-actions">'+
         (grouped?button('Подобрать лицензию','choose-group',id,'class="primary"'):cartControls(offer, context.cart.get(id)))+
         (url?'<a class="chat-icon" href="'+attr(url)+'" target="_blank" rel="noreferrer" aria-label="Карточка на сайте" title="Карточка на сайте">'+icon('external')+'</a>':'')+'</div></div></article>';
     },catalogSearch?.query?'Товары не найдены. Уточните запрос.':'Товаров пока нет.')+'</div>'+pagination+'</section>';

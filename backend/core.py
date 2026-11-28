@@ -247,7 +247,10 @@ class Store:
         version = f"{source}:{self.feed_path.stat().st_mtime_ns}:v11" if self.feed_path else f"{source}:v3"
         with self.storage.connect(write=True) as db:
             existing = db.execute("SELECT value FROM catalog WHERE key='version'").fetchone()
+            db.execute("CREATE TABLE IF NOT EXISTS catalog_display(position INTEGER PRIMARY KEY, offer_id TEXT UNIQUE NOT NULL)")
             if existing and existing[0] == version:
+                if not db.execute("SELECT 1 FROM catalog_display LIMIT 1").fetchone():
+                    self._index_display(db)
                 return
             db.execute("DELETE FROM offers")
             db.executemany("INSERT INTO offers VALUES (?,?,?,?)", (
@@ -260,6 +263,31 @@ class Store:
             db.executemany("INSERT OR REPLACE INTO catalog VALUES (?,?)",
                            [("version", version), ("source", "xml" if self.feed_path else "synthetic"),
                             ("count", str(count)), ("imported_at", now())])
+
+            self._index_display(db)
+
+    @staticmethod
+    def _index_display(db):
+        # Choose one representative per product before interleaving the catalog.
+        db.execute("DELETE FROM catalog_display")
+        db.execute("""
+            INSERT INTO catalog_display(offer_id)
+            WITH products AS (
+                SELECT COALESCE(MIN(CASE WHEN json_extract(body,'$.available') THEN id END), MIN(id)) AS sku,
+                       COUNT(*) AS variants, MAX(json_extract(body,'$.available')) AS buyable
+                FROM offers GROUP BY COALESCE('g:' || json_extract(body,'$.group_id'), 's:' || id)
+            ), cards AS (
+                SELECT sku, CASE WHEN NOT buyable THEN 2 WHEN variants > 1 THEN 1 ELSE 0 END AS kind,
+                       COALESCE(NULLIF(json_extract(body,'$.vendor'),''),category,'') AS brand
+                FROM products JOIN offers ON id=sku
+            ), brands AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY kind,brand ORDER BY sku) AS brand_rank FROM cards
+            ), ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY kind ORDER BY brand_rank,sku)-1 AS n FROM brands
+            )
+            SELECT sku FROM ranked ORDER BY
+                CASE kind WHEN 0 THEN (n/2)*4+(n%2)*2 WHEN 1 THEN n*4+1 ELSE n*4+3 END, sku
+        """)
 
     @staticmethod
     def _check(role, scope):
@@ -313,9 +341,9 @@ class Store:
             args.extend([f"%{word.replace('_', '!_')}%"] * 2)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
         if by_product and not words:
-            # The first SKU in ID order represents its product on the storefront.
-            rows = db.execute("SELECT body FROM offers ORDER BY id")
-            return self._catalog_cards(db, state, (self._offer(row[0], state) for row in rows), limit, offset)
+            rows = db.execute("SELECT body FROM catalog_display JOIN offers ON id=offer_id "
+                              "WHERE position > ? ORDER BY position LIMIT ?", (offset, limit))
+            return self._catalog_cards(db, state, (self._offer(row[0], state) for row in rows), limit)
         if by_product:
             availability_first = "available DESC, " if words else ""
             rows = db.execute(f"""
@@ -351,9 +379,14 @@ class Store:
                 offset -= 1
                 continue
             if group_id:
-                variants = [json.loads(row[0]) for row in self._group_rows(db, group_id)]
+                variants = [self._offer(row[0], state) for row in self._group_rows(db, group_id)]
                 if len(variants) > 1:
+                    buyable = [item for item in variants if item["available"] and item["price"] > 0]
+                    currencies = {item["currency"] for item in buyable}
                     offer = {**offer, "group_name": catalog_groups.group_name(variants)}
+                    if len(currencies) == 1:
+                        offer["group_price_from"] = min(item["price"] for item in buyable)
+                        offer["group_price_currency"] = next(iter(currencies))
             cards.append(offer)
             if len(cards) == limit:
                 break

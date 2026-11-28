@@ -8,6 +8,23 @@ from backend.catalog_groups import followup
 
 
 class TestCatalogGroups(unittest.TestCase):
+    def test_storefront_visits_all_groups_once_and_starts_with_buyable_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            feed = root / "catalog.xml"
+            items = [("01", "g", 0), ("02", "g", 155), ("03", "g", 90), ("04", "other", 0)]
+            items += [(str(i), str(i), 100) for i in range(10, 15)]
+            feed.write_text("<shop><offers>" + "".join(
+                f'<offer id="{i}" group_id="{g}" available="{str(bool(price)).lower()}"><name>Item {i}</name>'
+                f'<price>{price}</price></offer>' for i,g,price in items) + "</offers></shop>", encoding="utf8")
+            store = Store(root / "db", feed)
+            pages = [store.act("buyer", "search", {"by_product": True, "page": page, "limit": 4}, "stand")["offers"]
+                     for page in (1, 2)]
+            self.assertEqual([o["available"] for o in pages[0]], [True, True, True, False])
+            self.assertEqual(pages[0][1]["group_price_from"], 90)
+            self.assertEqual(len({o["group_id"] for page in pages for o in page}), 7)
+            self.assertEqual(len(pages[0]) + len(pages[1]), 7)
+
     def test_comparison_uses_only_catalog_evidence(self):
         offers = [{"name": "Атлас", "params": {"Формат": ["PDF"], "Язык": ["русский"]}},
                   {"name": "Спектр", "params": {"Формат": ["SVG"], "Язык": ["русский"]}}]
@@ -82,14 +99,16 @@ class TestCatalogGroups(unittest.TestCase):
             snapshot = store.snapshot("buyer", scope)
             self.assertEqual(len(snapshot["offers"]), 4)
             self.assertEqual(len(snapshot["catalog"]), 2)
-            self.assertEqual(snapshot["catalog"][0]["group_name"], "DriveLED 4")
+            self.assertEqual(snapshot["catalog"][1]["group_name"], "DriveLED 4")
+            self.assertEqual(snapshot["catalog"][1]["group_price_from"], 20)
             self.assertFalse(snapshot["catalog_has_more"])
             cards = act("search", query="DriveLED", limit=2, by_product=True)["offers"]
             self.assertEqual([card["group_id"] for card in cards], ["7863", "other"])
             for query in ("", "DriveLED"):
                 first, last, empty = (act("search", query=query, page=page, limit=1, by_product=True)
                                       for page in (1, 2, 3))
-                self.assertEqual([first["offers"][0]["group_id"], last["offers"][0]["group_id"]], ["7863", "other"])
+                self.assertEqual([first["offers"][0]["group_id"], last["offers"][0]["group_id"]],
+                                 ["7863", "other"] if query else ["other", "7863"])
                 self.assertEqual((first["has_more"], last["has_more"], empty["offers"]), (True, False, []))
             with self.assertRaises(ValueError):
                 act("search", by_product=True, page=0)
