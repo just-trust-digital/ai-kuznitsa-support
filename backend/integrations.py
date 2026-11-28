@@ -272,7 +272,7 @@ class HybridEngine:
             decision = invoke(jev_transport, usage, "jev", SYSTEM_ONE_TOKENS, 'https://api.typesafe.ai/v1/systemone', {'model': self.jev_model, 'state': state, 'questions': QUESTIONS}, self.jev_key)
             route = decision['answers']['route']['choice']
             probability = decision['answers']['route'].get('probabilities', {}).get(route, 0)
-            if route not in ('billing', 'technical') or probability < .85:
+            if route not in ('billing', 'technical') or probability < (.5 if self.clef_url else .85):
                 return {'text': '', 'mode': 'local_required', 'verified_model': False, 'usage': usage}
             instruction = CONSULTATION_PROMPT if consultation else "Answer only using supplied public product facts. Do not invent order, license or customer data."
             if self.clef_url:
@@ -280,7 +280,8 @@ class HybridEngine:
                     return self.transport(url, payload, token)['result']
                 review = invoke(classify, usage, "clef", SYSTEM_ONE_TOKENS, self.clef_url,
                                 {'state': state, 'questions': QUESTIONS}, self.clef_token)
-                if review['answers']['route']['choice'] != route:
+                checked = review['answers']['route']
+                if checked['choice'] != route or checked.get('probabilities', {}).get(route, 0) < .5:
                     return {'text': '', 'mode': 'local_required', 'verified_model': False, 'usage': usage}
                 instruction += ' Не добавляй приглашение обращаться к менеджеру с дальнейшими вопросами.'
             if self.cloud_generator:

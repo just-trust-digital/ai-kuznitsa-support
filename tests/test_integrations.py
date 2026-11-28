@@ -50,7 +50,7 @@ class HybridTests(unittest.TestCase):
             if 'typesafe.ai' in url:
                 return route
             if 'cloudflare.com' in url:
-                return {'result': {'answers': {'route': {'choice': clef_choice}}}}
+                return {'result': {'answers': {'route': {'choice': clef_choice, 'probabilities': {clef_choice:.9}}}}}
             return {'choices': [{'message': {'content': 'Проверено'}}]}
         engine = HybridEngine({'s': {'name':'Demo', 'secret':'PRIVATE'}}, [], 'jev-latest',
                               'https://inference-api.nousresearch.com/v1/chat/completions',
