@@ -453,7 +453,9 @@ class Store:
         catalog_groups.update_request(text, incoming, parameters)
         if capacity and "quantity" not in pending:
             parameters.pop("quantity", None)
-        constraints = {key: parameters[key] for key in ("architecture", "platforms") if key in parameters}
+        if incoming.get("seats") and not capacity:
+            parameters["seats"] = incoming["seats"]
+        constraints = {key: parameters[key] for key in ("architecture", "platforms", "seats") if key in parameters}
         matches = [offer for offer in offers if catalog_groups.matches(offer, parameters) and
                    self._matches_constraints(offer, constraints)]
         quantity = parameters.get("quantity")
@@ -725,7 +727,11 @@ class Store:
             for record in facts:
                 if not record["price"] or record["price"] <= 0:
                     record["price"] = None
-        result = self.hybrid_engine.freeform(reviews.redact(text), history, facts)
+            topic = sales_chat.support_topic(text)
+            instruction = state.get("support_answers", {}).get(topic, {}).get("text")
+            if not sales_chat.is_navigation_answer(instruction):
+                instruction = None
+        result = self.hybrid_engine.freeform(reviews.redact(text), history, facts, instruction)
         with self.storage.connect(write=True) as db:
             for provider, usage in result["usage"].items():
                 self.storage.add_usage(db, scope, provider, [usage[key] for key in USAGE_FIELDS])
@@ -1764,9 +1770,18 @@ class Store:
                 self._message(dialog, "assistant", "По какой позиции проверить скидку? Откройте карточку и выберите «Расскажите о товаре» в новом чате.")
             return self._decision(dialog, "discount", "confirm_offer")
         if facts:
-            for answer, source, intent in facts:
-                self._message(dialog, "assistant", answer, source=source, mode="rules")
             sources = list(dict.fromkeys(source for _, source, _ in facts))
+            # A prepared consultation answers assertive topics from the same evidence;
+            # rules keep only the clarifying prompts and the fallback question.
+            consultation = model if isinstance(model, dict) and model.get("structured") else None
+            for answer, source, intent in facts:
+                if consultation and intent not in {"tax", "renewal"}:
+                    continue
+                self._message(dialog, "assistant", answer, source=source, mode="rules")
+            if consultation and dialog["messages"][-1]["role"] != "assistant":
+                self._message(dialog, "assistant",
+                              "Какой шаг нужно уточнить: оформление заказа, доставка или документы по заказу?",
+                              mode="rules", fallback=True)
             needs_order_check = re.search(
                 r'(?:не приш|не получ|не отображ|не виж|почему|когда).{0,80}(?:ключ|дистрибутив|сч[её]т)|'
                 r'(?:ключ|дистрибутив|сч[её]т).{0,80}(?:не приш|не получ|не отображ|не виж)', folded)

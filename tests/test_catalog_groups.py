@@ -34,6 +34,18 @@ class TestCatalogGroups(unittest.TestCase):
         self.assertNotIn("Язык", answer)
         self.assertIn("не хватает характеристик", followup("Сравните", [{"name": "А"}, {"name": "Б"}]))
 
+    def test_group_recommendations_respect_user_count_in_license(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            feed = root / "feed.xml"
+            offers = [f'<offer id="{n}" group_id="mail" available="true"><name>MDaemon на {n} пользователей</name>'
+                      f'<price>{n * 100}</price></offer>' for n in (6, 20)]
+            feed.write_text("<shop><offers>" + "".join(offers) + "</offers></shop>", encoding="utf8")
+            store = Store(root / "db", feed)
+            result = store.act("buyer", "message", {"text": "Нужна лицензия на 20 мест", "mode": "rules",
+                               "reference": {"type": "group", "id": "mail"}}, "stand")
+            self.assertEqual([o["id"] for o in result["dialog"]["messages"][-1]["offers"]], ["20"])
+
     def test_group_followups_and_unrelated_guest_task(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

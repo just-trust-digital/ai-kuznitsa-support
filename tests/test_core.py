@@ -863,5 +863,54 @@ class GroundedModelPublishing(unittest.TestCase):
         self.assertIn("384000", reply["text"])
 
 
+class KnowledgeFallbackNarrowing(unittest.TestCase):
+    """A prepared consultation answers knowledge topics; rules keep clarifying prompts."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.scope = "knowledge-fallback-scope"
+
+    @staticmethod
+    def knowledge_engine(answer_text, sources):
+        class Engine:
+            def answer(self, text, context=""):
+                evidence = json.loads(context)
+                assert evidence.get("knowledge"), "consultation must carry knowledge evidence"
+                payload = {"answer": answer_text, "sources": list(sources)}
+                return dict(text=json.dumps(payload, ensure_ascii=False), structured=payload,
+                            mode="local", verified_model=True, route="technical",
+                            decision_intent="knowledge", decision_probability=.9,
+                            needs_clarification=False)
+        return Engine()
+
+    def chat(self, engine, text):
+        store = Store(self.directory / f"{id(engine)}.db", engine=engine)
+        return store.act("buyer", "message", dict(text=text, mode="local"), self.scope)["dialog"]
+
+    def test_verified_answer_replaces_store_instruction(self):
+        engine = self.knowledge_engine(
+            "Добавьте товар в корзину и оформите заказ; для организации нужны её реквизиты.",
+            ["https://store.softline.ru/delivery_info/"])
+        dialog = self.chat(engine, "Как оформить заказ?")
+        replies = [m for m in dialog["messages"] if m["role"] == "assistant"]
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[-1]["mode"], "local")
+        self.assertTrue(replies[-1]["model"]["published"])
+        self.assertIn("реквизиты", replies[-1]["text"])
+        self.assertNotIn("плательщика", replies[-1]["text"])
+
+    def test_rejected_consultation_keeps_clarify_not_store_instruction(self):
+        engine = self.knowledge_engine(
+            "Оформление заказа проверит менеджер.", ["https://store.softline.ru/delivery_info/"])
+        dialog = self.chat(engine, "Как оформить заказ?")
+        replies = [m for m in dialog["messages"] if m["role"] == "assistant"]
+        self.assertEqual(len(replies), 1)
+        self.assertIn("Какой шаг нужно уточнить", replies[0]["text"])
+        self.assertNotIn("нажмите «Оформить заказ»", replies[0]["text"])
+        self.assertEqual(dialog["decision"]["next_action"], "inform")
+
+
 if __name__ == "__main__":
     unittest.main()

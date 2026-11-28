@@ -4,3 +4,5 @@
 - Контекст переписки проходит из `web/app.js` в `backend/core.py`. Карточка передаёт ID позиции, корзина передаёт ID и количество. Цену проверяет сервер.
 - Маршрутизация ответа начинается в `Store._answer`. Поисковые условия живут в `backend/selection.py`, справка в `backend/knowledge.py`, правила корзины в `backend/basket.py`. Передачу менеджеру проверь через `Store._route` и тесты в `tests/test_core.py`.
 - По моделям открой `backend/runtime.py` и `backend/integrations.py`. По стоимости используй `backend/economics.py` и `tests/test_economics.py`.
+
+В облачном чате Jev выбирает раздел справки. Qwen подбирает факты и составляет ответ с учётом условий покупателя. Jev проверяет текст по источникам. Если он находит ошибку, Qwen получает замечание и готовит новый ответ. Эту цепочку проверяет `tests/test_freeform_support.py`.

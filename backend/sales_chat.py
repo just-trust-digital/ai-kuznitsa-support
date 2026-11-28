@@ -75,13 +75,17 @@ def support_topic(question):
     return "/".join([action, *topics]) if topics else ""
 
 
+def is_navigation_answer(text):
+    return (isinstance(text, str) and bool(re.match(r"^(Откройте|Перейдите|Выберите|Нажмите)\b", text, re.I))
+            and not re.search(r"[^а-яёА-ЯЁ\s.,:«»→-]", text)
+            and set(re.findall(r"[а-яё]+", text.casefold())) <= NAVIGATION)
+
+
 def remember_reply(state, dialog):
     messages = dialog["messages"]
     last = messages[-1]
     answer = last["text"].strip()
-    if not re.match(r"^(Откройте|Перейдите|Выберите|Нажмите)\b", answer, re.I):
-        return
-    if re.search(r"[^а-яёА-ЯЁ\s.,:«»→-]", answer) or not set(re.findall(r"[а-яё]+", answer.casefold())) <= NAVIGATION:
+    if not is_navigation_answer(answer):
         return
     question = next((m["text"] for m in reversed(messages[:-1]) if m["role"] == "buyer"
                      and not re.fullmatch(r"(?:позовите |подключите )?(?:менеджера?|оператора?)[.! ]*",

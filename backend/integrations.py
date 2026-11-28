@@ -293,15 +293,17 @@ class HybridEngine:
     def consult(self, intent, sku):
         return self.hybrid(intent, sku, consultation=True)
 
-    def freeform(self, question, history, offers):
-        from .cloud_support import ACTIONS, EDITOR, GUIDE, PROMPT, SOURCES
+    def freeform(self, question, history, offers, navigation=None):
+        from .cloud_support import ACTIONS, EDITOR, FACTS, GUIDE, PROMPT, REVIEW, SOURCES
         state = dict(question=question, history=history, offers=offers)
+        if navigation:
+            state["navigation"] = navigation
         usage = {}
         try:
             transport = post_jev if self.transport is post and os.name == "nt" else self.transport
             decision = invoke(transport, usage, "jev", SYSTEM_ONE_TOKENS,
                               "https://api.typesafe.ai/v1/systemone",
-                              {"model": self.jev_model, "state": {"question": question, "history": history, "offers": offers},
+                              {"model": self.jev_model, "state": state,
                                "questions": ACTIONS}, self.jev_key)
             suggestion = decision["answers"]["action"]["choice"]
             choices = ACTIONS["action"]["criteria"]
@@ -310,41 +312,102 @@ class HybridEngine:
             topic = decision["answers"]["topic"]["choice"]
             if topic not in ACTIONS["topic"]["criteria"]:
                 raise ValueError("Unknown topic")
-            source_url = SOURCES.get(topic)
-            state["guide"] = {source_url: GUIDE[source_url]} if source_url else {}
-            if topic == "cabinet":
-                state["guide"][SOURCES["license"]] = GUIDE[SOURCES["license"]]
-            if topic in {"license", "cabinet"}:
-                state["guide"][SOURCES["store"]] = GUIDE[SOURCES["store"]]
-            if topic == "catalog":
+            additional = decision["answers"].get("second_topic", {}).get("choice", "none")
+            if additional not in ACTIONS["second_topic"]["criteria"]:
+                raise ValueError("Unknown secondary topic")
+            topics = {topic, additional}
+            state["guide"] = {url: GUIDE[url] for name, url in SOURCES.items() if name in topics}
+            if topics.intersection({"catalog", "conditions"}):
                 state["catalog_policy"] = (
-                    "Количество, срок и условия из сообщения позволяют сравнить варианты без номера товара. "
-                    "Неизвестная цена не мешает отвечать о других известных свойствах. Для точного состава "
-                    "редакции нужна спецификация, для совместимости нужны продукт, устройство и ОС."
+                    "Для программного обеспечения размер лицензии может означать число пользователей или "
+                    "рабочих мест, а редакция определяет набор функций. "
+                    "Состав редакции проверяют по спецификации. Для совместимости сравнивают требования конкретной программы с устройством и его ОС. "
+                    "Независимо от цены минимальная партия известна только при заполненном поле количества. Пустое поле цены означает, что цена неизвестна."
                 )
-            state["suggestion"] = suggestion
             def generate(instruction, evidence, reasoning):
                 messages = [{"role": "system", "content": instruction},
                             {"role": "user", "content": json.dumps(evidence, ensure_ascii=False)}]
-                response = invoke(self.transport, usage, "cloud", CHAT_TOKENS, self.cloud_url,
-                                  {"model": self.cloud_model, "messages": messages, "temperature": 0,
-                                   "max_tokens": 4096, "reasoning": {"enabled": reasoning},
-                                   "response_format": {"type": "json_object"}}, self.cloud_key)
-                return json.loads(response["choices"][0]["message"]["content"])
+                options = {"model": self.cloud_model, "messages": messages, "temperature": 0,
+                           "max_tokens": 4096, "reasoning": {"enabled": reasoning},
+                           "response_format": {"type": "json_object"}}
+                def completion():
+                    response = invoke(self.transport, usage, "cloud", CHAT_TOKENS, self.cloud_url,
+                                      options, self.cloud_key)
+                    return response["choices"][0]
 
-            draft = generate(PROMPT, state, False)
-            editorial_state = {**state, "draft": draft}
-            if topic in {"store", "catalog", "conditions"}:
-                editorial_state["general_terms"] = (
-                    "Обычный заказ доступен физическим лицам и организациям; специальных условий для "
-                    "самозанятых в справке нет. Годовой срок равен одному году, бессрочный не имеет "
+                try:
+                    choice = completion()
+                except urllib.error.HTTPError as exc:
+                    if exc.code not in (502, 503, 504):
+                        raise
+                    options["reasoning"] = {"enabled": False}
+                    choice = completion()
+                except (TimeoutError, ConnectionResetError):
+                    options["reasoning"] = {"enabled": False}
+                    choice = completion()
+                if options["reasoning"]["enabled"] and choice.get("finish_reason") == "length":
+                    options["reasoning"] = {"enabled": False}
+                    choice = completion()
+                return json.loads(choice["message"]["content"])
+
+            if topics.intersection({"store", "catalog", "conditions"}):
+                state["general_terms"] = (
+                    "Обычный заказ доступен физическим лицам и организациям; возможность специальных условий для "
+                    "самозанятых нужно проверить отдельно, результат проверки неизвестен. Годовой срок равен одному году, бессрочный не имеет "
                     "заданной даты окончания. Пределы количества включают указанные границы."
                 )
-            answer = generate(EDITOR, editorial_state, True)
+            passages = dict(FACTS)
+            for field in ("catalog_policy", "general_terms"):
+                if field in state:
+                    passages[field] = {f"{field}_{i}": sentence.rstrip(".") + "."
+                                       for i, sentence in enumerate(state[field].split(". "))}
+            retrieval = {**state, "suggested_sources": list(state["guide"]), "guide": passages}
+            selection = generate(PROMPT, retrieval, False)
+            fact_ids = selection.get("fact_ids")
+            premises = selection.get("premises")
+            if isinstance(premises, list):
+                state["premises"] = list(dict.fromkeys(
+                    part for part in premises if isinstance(part, str) and part.strip() and part in question
+                ))
+            answer_state = state.copy()
+            conclusion = selection.get("conclusion")
+            if conclusion in ("yes", "no", "conditional", "unknown", "open"):
+                answer_state["conclusion_to_check"] = conclusion
+            if isinstance(fact_ids, list):
+                requested = {key for key in fact_ids if isinstance(key, str)}
+                excerpts = {}
+                for source, facts in passages.items():
+                    selected = [fact for key, fact in facts.items() if key in requested]
+                    if selected:
+                        excerpts[source] = " ".join(selected)
+                if excerpts:
+                    answer_state["guide"] = {k: v for k, v in excerpts.items() if k in GUIDE}
+                    for field in ("catalog_policy", "general_terms"):
+                        if field in excerpts:
+                            answer_state[field] = excerpts[field]
+                        else:
+                            answer_state.pop(field, None)
+            # Preserve Jev's independently selected source when the retriever chose another topic.
+            answer_state["related_guide"] = {url: text for url, text in state["guide"].items()
+                                             if url not in answer_state["guide"]}
+            answer = generate(EDITOR, answer_state, True)
+            review_state = {k: v for k, v in state.items() if k != "suggestion"}
+            review_state["guide"] = {url: GUIDE[url] for url in (*state["guide"], *answer_state["guide"])}
+            review = invoke(transport, usage, "jev", SYSTEM_ONE_TOKENS,
+                            "https://api.typesafe.ai/v1/systemone",
+                            {"model": self.jev_model, "state": {**review_state, "reply": answer},
+                             "questions": REVIEW}, self.jev_key)
+            verdict = review["answers"]["verdict"]["choice"]
+            if verdict not in REVIEW["verdict"]["criteria"]:
+                raise ValueError("Unknown reply verdict")
+            if verdict != "approve":
+                issue = REVIEW["verdict"]["criteria"][verdict]
+                # Reconstruct from verified sources: an unsupported draft can anchor a second answer.
+                answer = generate(EDITOR, {**review_state, "review_issue": issue}, True)
             action, body, source = answer["action"], answer["text"], answer.get("source")
             if action not in choices or not isinstance(body, str) or not body.strip():
                 raise ValueError("Invalid support answer")
-            if source and source not in state["guide"] and source not in [o.get("url") for o in offers]:
+            if source and source not in review_state["guide"] and source not in [o.get("url") for o in offers]:
                 raise ValueError("Unknown source")
             return dict(freeform=True, verified_model=True, mode="hybrid", text=body.strip(),
                         route=action, source=source, jev_action=suggestion, usage=usage)
