@@ -89,7 +89,7 @@ class ManagerNotifications:
             db.execute("INSERT OR REPLACE INTO telegram_codes VALUES (?, ?, ?, ?)",
                        (chat["id"], hashed, now, now + CODE_LIFETIME))
         try:
-            self.call("sendMessage", {"chat_id": chat["id"], "protect_content": True,
+            self.call("sendMessage", {"chat_id": chat["id"],
                       "text": f"Код для стенда Softline\n\n{code}\n\nВведите его на стенде в разделе «Уведомления в Telegram». Код действует 5 минут."})
         except RuntimeError:
             print(f"Telegram pairing response failed (update {update_id})", file=sys.stderr, flush=True)
