@@ -402,7 +402,8 @@ function handoffLabel(d) {
 }
 function buyerChat(d) {
   const viewedOffer = (tab ?? 'catalog')==='catalog' ? clientContext().viewed : undefined;
-  const greeting = viewedOffer?.group_name ? 'Какая лицензия нужна для «'+viewedOffer.group_name+'»?' :
+  const productQuestion = ['offer','group'].includes(referenceDraft?.type);
+  const greeting = productQuestion ? 'Здравствуйте! Что хотите узнать об этом товаре?' : viewedOffer?.group_name ? 'Какая лицензия нужна для «'+viewedOffer.group_name+'»?' :
     'Здравствуйте! Ищете конкретную программу или помочь с выбором?';
   const questions={
     group:['Подобрать лицензию'],
@@ -423,7 +424,7 @@ function buyerChat(d) {
     ((!d || d.status==='open')?button('Позвать менеджера','call-manager',d?.id ?? ''):'')+
     button('Мои обращения','chat-history','')+'</div>';
   const history=chatPane==='history'?'<div class="chat-history"><div class="history-heading"><h3>Мои обращения</h3>'+button('К переписке','chat-thread','')+'</div>'+chatHistory()+'</div>':'';
-  const thread = d?conversation(d):(referenceDraft || kind==='offer')?'':'<p class="bubble">'+escape(displayText(greeting))+'</p>';
+  const thread = d?conversation(d):(!productQuestion && (referenceDraft || kind==='offer'))?'':'<p class="bubble">'+escape(displayText(greeting))+'</p>';
   const last=d?.messages.at(-1);
   let choices=list(last?.choices);
   if (!choices.length && last?.offers?.some(o=>o.group_recommendation)) {

@@ -301,10 +301,25 @@ class HybridEngine:
         usage = {}
         try:
             transport = post_jev if self.transport is post and os.name == "nt" else self.transport
+            # Offer complete, sourced replies to the decision model alongside its routing choices.
+            direct = {}
+            for index, offer in enumerate(offers):
+                if not offer.get("url") or not offer.get("name"):
+                    continue
+                for part in (offer.get("description") or "").split("•"):
+                    label, sep, value = part.strip().partition(":")
+                    if sep and label.casefold() in {"язык интерфейса", "платформа"} and value.strip():
+                        key = f"offer_{index}_{len(direct)}"
+                        direct[key] = (f"{offer['name']}. {label}: {value.strip()}.", offer["url"])
+            questions = dict(ACTIONS)
+            if direct:
+                questions["direct"] = {"type": "choice",
+                    "instructions": "Выбери готовый ответ только если товар и свойство совпадают и ответ полностью закрывает последнюю просьбу. При сравнении, нескольких просьбах или неоднозначности выбери none.",
+                    "criteria": {"none": "Нужна консультация.", **{k: v[0] for k, v in direct.items()}}}
             decision = invoke(transport, usage, "jev", SYSTEM_ONE_TOKENS,
                               "https://api.typesafe.ai/v1/systemone",
                               {"model": self.jev_model, "state": state,
-                               "questions": ACTIONS}, self.jev_key)
+                               "questions": questions}, self.jev_key)
             suggestion = decision["answers"]["action"]["choice"]
             choices = ACTIONS["action"]["criteria"]
             if suggestion not in choices:
@@ -315,6 +330,13 @@ class HybridEngine:
             additional = decision["answers"].get("second_topic", {}).get("choice", "none")
             if additional not in ACTIONS["second_topic"]["criteria"]:
                 raise ValueError("Unknown secondary topic")
+            pick = decision["answers"].get("direct", {})
+            key = pick.get("choice")
+            if (key in direct and additional == "none" and suggestion not in {"handoff", "answer_and_handoff"}
+                    and pick.get("probabilities", {}).get(key, 0) >= .80):
+                body, source = direct[key]
+                return dict(freeform=True, verified_model=True, mode="hybrid", text=body, source=source,
+                            route="answer", jev_action=suggestion, providers=["jev"], usage=usage)
             topics = {topic, additional}
             state["guide"] = {url: GUIDE[url] for name, url in SOURCES.items() if name in topics}
             if topics.intersection({"catalog", "conditions"}):

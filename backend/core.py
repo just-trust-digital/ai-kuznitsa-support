@@ -705,7 +705,7 @@ class Store:
             for message in dialog.get("messages", [])[-8:]:
                 buyer_turn = message["role"] == "buyer" and not any(
                     message.get(key) for key in ("reference", "attachment", "quote"))
-                public_reply = (message.get("model") or {}).get("providers") == ["jev", "cloud"]
+                public_reply = (message.get("model") or {}).get("providers") in (["jev"], ["jev", "cloud"])
                 if buyer_turn or public_reply:
                     history.append({"role": message["role"], "text": reviews.redact(message["text"])})
 
@@ -722,7 +722,7 @@ class Store:
                     row = db.execute("SELECT body FROM offers WHERE id=?", (viewed_id,)).fetchone()
                     if row:
                         offers = [self._offer(row[0], state)]
-            facts = [{k: o.get(k) for k in ("name", "price", "currency", "url", "params",
+            facts = [{k: o.get(k) for k in ("name", "price", "currency", "url", "description", "params",
                                             "vendor_code", "available", "min_quantity", "max_quantity")} for o in offers]
             for record in facts:
                 if not record["price"] or record["price"] <= 0:
@@ -735,7 +735,9 @@ class Store:
         with self.storage.connect(write=True) as db:
             for provider, usage in result["usage"].items():
                 self.storage.add_usage(db, scope, provider, [usage[key] for key in USAGE_FIELDS])
-        return {**result, "buyer_id": actor, "requested_mode": "hybrid", "viewed_offer": viewed_id}
+        matched = [offer["id"] for offer in offers if result.get("source") and offer.get("url") == result["source"]]
+        return {**result, "buyer_id": actor, "requested_mode": "hybrid", "viewed_offer": viewed_id,
+                "answer_offer_id": matched[0] if len(matched) == 1 else None}
 
     def _prepare_model(self, role, action, payload, scope, request, fingerprint):
         chat = role == "buyer" and action == "message"
@@ -1300,9 +1302,11 @@ class Store:
                 if model.get("viewed_offer"):
                     dialog["viewed_offer"] = model["viewed_offer"]
                 action_choice = model["route"]
+                item = db.execute("SELECT body FROM offers WHERE id=?", (model.get("answer_offer_id"),)).fetchone()
+                cards = {"offers": [self._offer(item[0], state)]} if item else {}
                 self._message(dialog, "assistant", model["text"], mode="hybrid", source=model["source"],
                               model={**self._model_metadata(model), "published": True,
-                                     "jev_action": model["jev_action"], "providers": ["jev", "cloud"]})
+                                     "jev_action": model["jev_action"], "providers": model.get("providers", ["jev", "cloud"])}, **cards)
                 self._decision(dialog, "support", {"answer": "inform", "clarify": "clarify",
                                "handoff": "handoff", "answer_and_handoff": "handoff"}[action_choice],
                                evidence=[model["source"]] if model["source"] else [])
