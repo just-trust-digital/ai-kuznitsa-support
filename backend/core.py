@@ -301,6 +301,11 @@ class Store:
         return offer
 
     def _search(self, db, state, query="", limit=12, *, by_product=False, offset=0):
+        identifier = query.strip()
+        if identifier:
+            exact = db.execute("SELECT body FROM offers WHERE id=?", (identifier,)).fetchone()
+            if exact:
+                return [] if offset else [self._offer(exact[0], state)]
         words = re.findall(r"\w+", search_key(query))[:8]
         conditions, args = [], []
         for word in words:
@@ -657,23 +662,29 @@ class Store:
                 if buyer_turn or public_reply:
                     history.append({"role": message["role"], "text": reviews.redact(message["text"])})
 
-            facets = facets_for(text)
-            offers = self._conversation_offers(db, state, text, facets, 4)
             viewed_id = payload.get("viewed_offer_id") or dialog.get("viewed_offer")
-            if viewed_id and not facets.get("product") and not facets.get("article"):
-                row = db.execute("SELECT body FROM offers WHERE id=?", (viewed_id,)).fetchone()
-                if row:
-                    offers = [self._offer(row[0], state)]
+            reference = payload.get("reference")
+            if reference:
+                _, offer = self._message_reference(db, state, reference)
+                offers = [offer]
+                viewed_id = offer["id"]
+            else:
+                facets = facets_for(text)
+                offers = self._conversation_offers(db, state, text, facets, 4)
+                if viewed_id and not facets.get("product") and not facets.get("article"):
+                    row = db.execute("SELECT body FROM offers WHERE id=?", (viewed_id,)).fetchone()
+                    if row:
+                        offers = [self._offer(row[0], state)]
             facts = [{k: o.get(k) for k in ("name", "price", "currency", "url", "params",
                                             "vendor_code", "available", "min_quantity", "max_quantity")} for o in offers]
             for record in facts:
-                if not record["available"]:
+                if not record["price"] or record["price"] <= 0:
                     record["price"] = None
         result = self.hybrid_engine.freeform(reviews.redact(text), history, facts)
         with self.storage.connect(write=True) as db:
             for provider, usage in result["usage"].items():
                 self.storage.add_usage(db, scope, provider, [usage[key] for key in USAGE_FIELDS])
-        return {**result, "buyer_id": actor, "requested_mode": "hybrid"}
+        return {**result, "buyer_id": actor, "requested_mode": "hybrid", "viewed_offer": viewed_id}
 
     def _prepare_model(self, role, action, payload, scope, request, fingerprint):
         chat = role == "buyer" and action == "message"
@@ -683,7 +694,8 @@ class Store:
         mode = payload.get("mode", self._default_model_mode() if chat else "rules")
         if mode not in ("rules", "local", "hybrid"):
             raise ValueError("Неизвестный режим ответа")
-        if mode == "rules" or (chat and (payload.get("starter") or payload.get("reference"))):
+        reference = payload.get("reference", {})
+        if mode == "rules" or (chat and (payload.get("starter") or (reference and reference["type"] != "offer"))):
             return None
         text = string(payload, "text", optional=bool(payload.get("attachment"))) if chat else ""
         if chat and not text:
@@ -696,6 +708,8 @@ class Store:
                 and not ((demo_account.license_lookup(text, {}) and not self_service) or demo_account.contract_lookup(text)
                          or asks_edi_status(text))):
             return self._freeform_support(payload, scope, request, fingerprint, text)
+        if reference:
+            return None
         fragments = requests_plan.parts(text) if chat else []
         if len(fragments) > 1:
             # Only prepare grounded product consultations; account and basket data stay on their normal paths.
@@ -1232,6 +1246,8 @@ class Store:
             self._decision(dialog, "catalog", "await_manager")
         elif dialog["status"] not in {"assigned", "queued"}:
             if model and model.get("freeform"):
+                if model.get("viewed_offer"):
+                    dialog["viewed_offer"] = model["viewed_offer"]
                 action_choice = model["route"]
                 self._message(dialog, "assistant", model["text"], mode="hybrid", source=model["source"],
                               model={**self._model_metadata(model), "published": True,
