@@ -204,7 +204,9 @@ class Handler(BaseHTTPRequestHandler):
                         request_customer.set(jury_visitor)
                     role = "buyer"
                     if action == "message":
-                        payload["mode"] = "rules"
+                        payload["mode"] = ("hybrid" if getattr(self.server.store, "runtime_config", {})
+                                           .get("hybrid", {}).get("freeform") and payload.get("mode") != "rules"
+                                           else "rules")
                 if action in {"buyer_select", "clear_history"} and identity != "jury":
                     raise PermissionError()
                 if length > 65536 and (action not in {"message", "reply"} or not payload.get("attachment")):

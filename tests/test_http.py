@@ -78,6 +78,7 @@ class TestStandAccess(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["chat_id"], 701)
         self.assertIn("Вам назначено новое обращение", sent[0]["text"])
+        self.assertIn("Причина передачи: Запрос покупателя", sent[0]["text"])
         handoff["payload"]["request_id"] = "second"
         self.assertEqual(self.call("/api/action", "buyer", handoff)[0], 200)
         self.assertEqual(self.call("/api/action", "manager1", {"action": "telegram_logout"},
@@ -178,6 +179,18 @@ class TestStandAccess(unittest.TestCase):
         ]})
         self.assertEqual(dialog["decision"]["intent"], "basket")
         self.assertIn(second["id"], dialog["decision"]["evidence"])
+        quantity = second.get("min_quantity", 1)
+        dialog = ask("Сформируйте КП на эту позицию", reference={"type": "offer", "id": second["id"]},
+                     page_context={"type": "basket", "selected_offer_id": second["id"], "items": [
+                         {"offer_id": first["id"], "quantity": first.get("min_quantity", 1)},
+                         {"offer_id": second["id"], "quantity": quantity},
+                     ]})
+        self.assertEqual(dialog["decision"]["evidence"], [second["id"]])
+        document_id = next(message["document_id"] for message in dialog["messages"] if "document_id" in message)
+        snapshot = json.loads(self.call("/api/state?role=buyer", "jury")[1])
+        document = next(row for row in snapshot["documents"] if row["id"] == document_id)
+        self.assertEqual(document["quantity"], quantity)
+        self.assertAlmostEqual(document["total"], second["price"] * quantity, places=2)
 
     def test_message_reference_in_open_chat_is_scoped_to_customer(self):
         self.tokens["visitor"] = "guest." + "c" * 64
@@ -232,6 +245,19 @@ class TestStandAccess(unittest.TestCase):
             dialog_id = dialog["id"]
             self.assertEqual(dialog["decision"]["missing"], [missing])
             self.assertFalse(dialog["messages"][-1].get("offers"))
+
+    def test_guest_receives_each_independent_answer_in_one_turn(self):
+        self.tokens["visitor"] = "guest." + "e" * 64
+        payload = {"role": "guest", "action": "message", "payload": {
+            "text": "Сколько стоит Dr.Web? Какой срок действия лицензии?", "mode": "rules", "request_id": "two-fields"}}
+        status, body = self.call("/api/action", "visitor", payload)
+        self.assertEqual(status, 200, body)
+        dialog = json.loads(body)["dialog"]
+        price, term = dialog["decision"]["parts"]
+        self.assertEqual(price["subjects"][0]["sku"], "demo-drweb")
+        self.assertIn("Срок действия", term["evidence"])
+        self.assertIn("12 мес.", dialog["messages"][-1]["text"])
+        self.assertEqual(json.loads(self.call("/api/action", "visitor", payload)[1])["dialog"], dialog)
 
     def test_guest_basket_follow_up_uses_latest_quantity(self):
         self.tokens["visitor"] = "guest." + "a" * 64

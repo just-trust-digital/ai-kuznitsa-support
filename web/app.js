@@ -14,7 +14,7 @@ const safeUrl = value => {
 let token = sessionStorage.getItem('softline-token') ?? '';
 let telegramSession = sessionStorage.getItem('softline-telegram-session');
 let telegramEnabled = false;
-let session, role, state, dialogId, result, tab, busy = false, samplePage = 0, sampleQuery = '', selectedOffer = '';
+let session, role, state, dialogId, result, tab, busy = false, samplePage = 0, sampleQuery = '', checkoutOffer;
 let errorText = '';
 let catalogSearch;
 const clientContexts = new Map();
@@ -53,6 +53,8 @@ let soundMuted=localStorage.getItem('softline-chat-muted')==='true';
 const clearComposer=()=>{ buyerDraft=staffDraft=''; quoteDraft=fileDraft=referenceDraft=undefined; };
 const chatIcons={
   close:'<path d="m6 6 12 12M18 6 6 18"/>',
+  bell:'<path d="M18 9a6 6 0 0 0-12 0c0 6-3 7-3 9h18c0-2-3-3-3-9ZM10 21h4"/>',
+  power:'<path d="M12 2v10M7 5a9 9 0 1 0 10 0"/>',
   more:'<path d="M12 5h.01M12 12h.01M12 19h.01" stroke-width="3.5"/>',
   reply:'<path d="M9 5 3 11l6 6v-4h4c4 0 6 2 8 5 0-7-3-9-8-9H9Z"/>',
   attach:'<path d="m8 13 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 0 1-7-7l9-9m-5 9a1 1 0 0 0 2 2l7-7"/>',
@@ -90,9 +92,11 @@ function notifyMessage() {
 }
 const modes = [['rules','По сценарию'],['local','Локальная модель'],['hybrid','Модель и каталог']];
 function resetWorkspace() {
+  telegramOpen=false;
   chatOpen = launcherSeen = training = false;
   clearComposer();
-  chatPane=selectedOffer='';
+  chatPane='';
+  checkoutOffer=undefined;
   catalogSearch=undefined;
 }
 const requestIds = new WeakMap();
@@ -151,7 +155,6 @@ async function roleState(nextRole) {
 async function loadState() { state = await roleState(role); buyerMode ??= state.default_model_mode || 'local'; }
 async function loadCatalog(query, page) {
   const data = await request('/api/action',{role,action:'search',payload:{query,by_product:true,page,limit:8}});
-  selectedOffer='';
   catalogSearch={query,page:data.page ?? page,offers:list(data.offers),hasMore:data.has_more===true};
 }
 async function signIn(value) {
@@ -179,6 +182,7 @@ async function signIn(value) {
   sessionStorage.setItem('softline-token',token);
 }
 async function act(action,payload) {
+  const previous=activeDialog();
   result = await request('/api/action',{role,action,payload});
   if (result.dialog) dialogId = result.dialog.id;
   if (action==='download') {
@@ -190,7 +194,29 @@ async function act(action,payload) {
     setTimeout(()=>URL.revokeObjectURL(url),1000);
   } else {
     await loadState();
+    if (action==='message' && chatPane==='continue') chatPane='';
+    if (result.dialog?.outcome && !(previous?.id===result.dialog.id && previous.outcome) &&
+        ['buyer','guest'].includes(role)) showDialogResult(result.dialog);
   }
+}
+function showDialogResult(d) {
+  const popup=document.createElement('dialog');
+  popup.className='dialog-result';
+  popup.setAttribute('aria-label','Итоги диалога');
+  const metrics=d.response_metrics;
+  const names={nimble:'Nimble',local_llm:'Локальная LLM',jev:'Jev',cloud:'Облачная LLM'};
+  const tokens=Object.entries(metrics?.usage ?? {}).map(([key,v])=>
+    '<li>'+escape(names[key] ?? key)+': '+v.input_tokens+' входящих, '+v.output_tokens+' исходящих'+
+    (v.calls>v.metered_calls?' (часть вызовов без показаний)':'')+'</li>').join('');
+  popup.innerHTML='<h2>Итоги диалога</h2><p>'+(d.outcome==='handoff'?'Передано менеджеру':'Вопрос решён с помощником')+'</p>'+
+    (d.night_demo?'<p>Время в демо: '+escape(d.night_demo)+' МСК. Смена начнётся в 09:00.</p>':'')+
+    (metrics?'<p>Время подготовки ответов: '+(metrics.ms<1000?metrics.ms.toLocaleString('ru-RU')+' мс':
+    (metrics.ms/1000).toLocaleString('ru-RU',{maximumFractionDigits:3})+' с')+'</p>'+
+    (tokens?'<h3>Токены по моделям</h3><ul>'+tokens+'</ul>':'<p>Токены моделей: 0</p>'):'<p>Замеры для этого обращения отсутствуют.</p>')+
+    '<form method="dialog"><button autofocus>Закрыть</button></form>';
+  document.body.append(popup);
+  popup.addEventListener('close',()=>popup.remove(),{once:true});
+  popup.showModal();
 }
 async function downloadChatFile(messageId) {
   const file=await request('/api/action',{role,action:'chat_file',payload:{dialog_id:dialogId,message_id:messageId}});
@@ -277,12 +303,14 @@ function conversation(dialog,staff=false) {
     const text=legacyOffer && (m.text===legacyText || m.text==='Что хотите уточнить по лицензии?')?'':m.text;
     const quote=m.quote?'<blockquote><b>'+escape(label(m.quote.role))+'</b><div>'+escape(displayText(m.quote.text))+'</div></blockquote>':'';
     const file=m.attachment?button(m.attachment.name,'chat-file',id,'class="chat-file"'):'';
+    const chatDocument=staff || !m.document_id?undefined:list(state.documents).find(d=>d.id===m.document_id);
+    const download=chatDocument?button(chatDocument.kind==='proposal'?'Скачать КП':'Скачать счёт','download',chatDocument.id):'';
     const reference=m.reference?'<div class="message-reference">'+icon('attach')+escape(displayText(m.reference.label))+'</div>':'';
     const reply=id && dialog.status!=='resolved' && !training && role!=='developer' && who!=='system'?iconButton('reply','Ответить на сообщение','quote',id):'';
     return '<article class="bubble '+(who === (staff?role:'buyer')?'mine':'')+'"><small>'+escape(label(speaker))+'</small>'+quote+
-      reference+'<div class="message-text" data-message="'+attr(id)+'">'+escape(displayText(text))+'</div>'+file+
-      offers.slice(0,1).map(o=>chatOffer(o,staff,m.show_offer_details)).join('')+
-      (offers.length>1?'<details><summary>Ещё варианты ('+(offers.length-1)+')</summary>'+offers.slice(1).map(o=>chatOffer(o,staff)).join('')+'</details>':'')+
+      reference+'<div class="message-text" data-message="'+attr(id)+'">'+escape(displayText(text))+'</div>'+file+download+
+      offers.slice(0,1).map(o=>chatOffer(o,staff || dialog.status==='resolved',m.show_offer_details)).join('')+
+      (offers.length>1?'<details><summary>Ещё варианты ('+(offers.length-1)+')</summary>'+offers.slice(1).map(o=>chatOffer(o,staff || dialog.status==='resolved')).join('')+'</details>':'')+
       (safeUrl(m.source)?'<a href="'+attr(safeUrl(m.source))+'" target="_blank" rel="noreferrer">Источник</a>':'')+
       (staff && training && id && (who==='assistant'||who==='bot')?
         '<div class="row">'+button('+' ,'rate',id,'aria-label="Ответ полезен" data-rating="+"')+button('−','rate',id,'aria-label="Ответ не помог" data-rating="-"')+'</div>':'')+
@@ -297,9 +325,8 @@ function offerPrice(offer, showComparison = true) {
     ? '<span class="reduced-price">'+current+' <span>Цена снижена</span></span> <del>'+escape(num(offer.old_price))+' '+escape(offer.currency)+'</del>' : current;
 }
 function offerAction(o, action) {
-  if (o.group_recommendation && o.available) {
-    const added=clientContext().cart.has(String(o.id));
-    return button(added?'В корзине':'В корзину','chat-cart',o.id,added?'disabled':'');
+  if (o.group_recommendation && o.available && !clientContext().cart.has(String(o.id))) {
+    return button('В корзину','chat-cart',o.id);
   }
   if (role==='guest' && o.price>0) return button('Войти для оформления','customer-login','');
   return o.price>0 ? button('Счёт или КП',action,o.id,'data-available="true"') : button('Запросить цену','price-request',o.id);
@@ -375,28 +402,32 @@ function handoffLabel(d) {
 }
 function buyerChat(d) {
   const viewedOffer = (tab ?? 'catalog')==='catalog' ? clientContext().viewed : undefined;
-  const greeting = viewedOffer?.group_name ? 'Здравствуйте! Помочь подобрать лицензию для «'+viewedOffer.group_name+'»?' :
-    viewedOffer ? 'Здравствуйте! Рассказать о товаре «'+viewedOffer.name+'»?' : 'Здравствуйте! Ищете конкретную программу или помочь с выбором?';
+  const greeting = viewedOffer?.group_name ? 'Какая лицензия нужна для «'+viewedOffer.group_name+'»?' :
+    'Здравствуйте! Ищете конкретную программу или помочь с выбором?';
   const questions={
-    offer:['Подробнее о товаре','Сколько стоит товар?'],
-    group:['Подобрать лицензию','Какие есть варианты?'],
-    cart:['Подробнее о товаре','Сколько стоит позиция?'],
+    group:['Подобрать лицензию'],
     order:['Какой статус заказа?','Ключ уже готов?'],
-    document:['Какая сумма документа?','Где скачать документ?'],
     license:['Лицензия ещё действует?','Где посмотреть лицензию?']
   };
-  const kind=referenceDraft?.kind ?? referenceDraft?.type ?? (viewedOffer && (viewedOffer.group_name?'group':'offer'));
-  const starters=kind?questions[kind].map(q=>button(q,'context-question',q)).join(''):
-    button('Ищу программу','starter','search')+button('Помогите с выбором','starter','choose');
+  const kind=referenceDraft?.type ?? (viewedOffer && (viewedOffer.group_name?'group':'offer'));
+  // The live assistant starts from free-form text. The button scenario stays
+  // available for the customer's decision: open the stand with ?scripted=1.
+  const scriptedStarters=new URLSearchParams(location.search).has('scripted');
+  const starters=questions[kind]?questions[kind].map(q=>button(q,'context-question',q)).join(''):
+    referenceDraft?'':viewedOffer?button('Задать вопрос о товаре','ask-product',viewedOffer.id):
+    scriptedStarters?button('Ищу программу','starter','search')+button('Помогите с выбором','starter','choose'):'';
   const menu='<div class="chat-options" id="chat-options" '+(chatPane==='options'?'':'hidden')+'>'+
     button('Новый чат','new-dialog','')+button(soundMuted?'Включить звук':'Выключить звук','sound','')+
-    (d && d.status!=='resolved'?button('Завершить консультацию','end-chat',d.id):'')+button('Мои обращения','chat-history','')+'</div>';
+    (d && !d.outcome && d.status==='open'?button('Завершить консультацию','end-chat',d.id):'')+
+    (session.role==='jury' && !d?.outcome && (!d || d.status==='open')?button('Ночная передача','night-transfer',d?.id ?? ''):'')+
+    ((!d || d.status==='open')?button('Позвать менеджера','call-manager',d?.id ?? ''):'')+
+    button('Мои обращения','chat-history','')+'</div>';
   const history=chatPane==='history'?'<div class="chat-history"><div class="history-heading"><h3>Мои обращения</h3>'+button('К переписке','chat-thread','')+'</div>'+chatHistory()+'</div>':'';
-  const thread = d?conversation(d):referenceDraft?'':'<p class="bubble">'+escape(displayText(greeting))+'</p>';
+  const thread = d?conversation(d):(referenceDraft || kind==='offer')?'':'<p class="bubble">'+escape(displayText(greeting))+'</p>';
   const last=d?.messages.at(-1);
   let choices=list(last?.choices);
   if (!choices.length && last?.offers?.some(o=>o.group_recommendation)) {
-    choices=last.offers.length>1?['Чем отличаются варианты?','Сколько стоят варианты?']:['Сколько стоит лицензия?'];
+    choices=last.offers.length>1?['Чем отличаются варианты?']:[];
   }
   if (d?.offer_email) choices=[...choices,'Отправить на почту'];
   const status = handoffLabel(d);
@@ -404,12 +435,31 @@ function buyerChat(d) {
     iconButton('more','Опции чата','chat-options')+iconButton('close','Закрыть чат','close-chat')+'</div>'+menu+history+
     '<div class="thread" '+(history?'hidden':'')+'>'+thread+'</div><div class="chat-foot" '+(history?'hidden':'')+'><p class="chat-error" role="alert"></p>'+
     (status?'<p class="handoff" role="status">'+escape(status)+'</p>':'')+
+    (d?.outcome?button('Итоги диалога','dialog-result',d.id):
+      d && (chatPane==='confirm' || ['inform','lookup','shortlist'].includes(d.decision?.next_action) && chatPane!=='continue')?
+      '<div>Мы решили ваш вопрос? '+button('Да','confirm-resolved',d.id)+button('Нет','continue-chat','')+'</div>':'')+
     (role==='guest' && d?.decision?.next_action==='login'?
       (session.role==='jury'?button('Переключиться на клиента','role','buyer'):button('Войти в кабинет','customer-login','')):'')+
-    (!referenceDraft && d?.status!=='resolved' && choices.length ? '<div class="quick-actions">'+
+    (!checkoutOffer && !referenceDraft && d?.status!=='resolved' && choices.length ? '<div class="quick-actions">'+
       choices.map(value=>button(value,'chat-choice',value)).join('')+'</div>' : '')+
-    (d?.status==='resolved'?button('Начать новый чат','new-dialog',''):(!d || referenceDraft?'<div class="quick-actions">'+starters+'</div>':'')+composer('message',buyerDraft))+
+    (d?.status==='resolved'?button('Начать новый чат','new-dialog',''):
+      (checkoutOffer?checkoutForm(checkoutOffer):
+        ((!d || referenceDraft) && starters?'<div class="quick-actions">'+starters+'</div>':'')+composer('message',buyerDraft)))+
     '</div></section>';
+}
+function checkoutForm(offer) {
+  const minimum=quantityOf(offer), maximum=offer.max_quantity || 100000;
+  const saved=clientContext().cart.get(String(offer.id))?.quantity;
+  const quantity=saved ?? offer.suggested_quantity ?? (minimum===maximum?minimum:undefined);
+  const known=Number.isInteger(quantity) && quantity>=minimum && quantity<=maximum;
+  const approved=activeDialog()?.approved_discount;
+  return form('document','<div class="checkout-heading"><strong>'+escape(displayText(offer.name))+'</strong>'+
+    iconButton('close','Закрыть оформление','cancel-checkout')+'</div>'+
+    hidden('offer_id',offer.id)+hidden('expected_price',offer.price)+
+    (known?hidden('quantity',quantity)+'<p>'+num(quantity)+' шт.</p>':
+      field('Количество','quantity','','type="number" min="'+minimum+'" max="'+maximum+'" required')+quantityTerms(offer))+
+    (String(approved?.offer_id)===String(offer.id)?'<p>Согласованная скидка '+num(approved.rate)+'%</p>':'')+
+    '<div class="row"><button class="primary" name="kind" value="invoice">Получить счёт</button><button name="kind" value="proposal">Получить КП</button></div>');
 }
 function composer(action,draft,id='') {
   const quote=quoteDraft?'<div class="composer-note"><blockquote><b>'+escape(label(quoteDraft.role))+'</b><div>'+escape(displayText(quoteDraft.preview))+'</div></blockquote>'+
@@ -443,13 +493,12 @@ function chatHistory() {
     return '<details><summary>'+escape(group[0].title.slice(0,100))+' ('+group.length+')</summary>'+group.map(entry).join('')+'</details>';
   },'Чатов пока нет.');
 }
-const catalogOffers = () => selectedOffer && result?.offers ? list(result.offers) :
-  catalogSearch?.offers ?? list(state.catalog ?? state.offers).slice(0,8);
+const catalogOffers = () => catalogSearch?.offers ?? list(state.catalog ?? state.offers).slice(0,8);
 function catalogPage() {
   const context = clientContext();
   const page=catalogSearch?.page ?? 1;
   const hasMore=catalogSearch?.hasMore ?? state.catalog_has_more;
-  const pagination=!selectedOffer && (hasMore || page>1)?'<nav class="catalog-pages" aria-label="Страницы каталога">'+
+  const pagination=(hasMore || page>1)?'<nav class="catalog-pages" aria-label="Страницы каталога">'+
     button('Назад','catalog-page',page-1,page===1?'disabled':'')+'<span>Страница '+num(page)+'</span>'+
     button('Дальше','catalog-page',page+1,hasMore?'':'disabled')+'</nav>':'';
   return '<section aria-label="Каталог программ">'+form('search','<div class="catalog-search"><input type="search" name="query" aria-label="Поиск по каталогу" value="'+
@@ -459,8 +508,6 @@ function catalogPage() {
       const grouped=Boolean(offer.group_name);
       const id = String(offer.id);
       const url = grouped?'':safeUrl(offer.url);
-      const approved=activeDialog()?.approved_discount;
-      const minimum=quantityOf(offer), maximum=offer.max_quantity || 100000;
       const viewed=grouped?context.viewed?.group_name && context.viewed.group_id===offer.group_id:String(context.viewed?.id)===id;
       const name=displayText(offer.group_name || offer.name);
       const brand=displayText(offer.vendor || name.split(/\s+/)[0]);
@@ -474,10 +521,7 @@ function catalogPage() {
         (description && description!==offer.name?'<p>'+escape(description)+'</p>':'')+(grouped?'':quantityTerms(offer))+'</div>'+
         '<div class="product-bottom">'+(grouped?'':'<strong>'+offerPrice(offer,false)+'</strong>')+'<div class="product-actions">'+
         (grouped?button('Подобрать лицензию','choose-group',id,'class="primary"'):cartControls(offer, context.cart.get(id)))+
-        (url?'<a class="chat-icon" href="'+attr(url)+'" target="_blank" rel="noreferrer" aria-label="Карточка на сайте" title="Карточка на сайте">'+icon('external')+'</a>':'')+'</div></div>'+
-        (offer.price>0 && role!=='guest' && String(offer.id)===selectedOffer ? form('document',hidden('offer_id',offer.id)+hidden('expected_price',offer.price)+field('Количество','quantity',minimum,'type="number" min="'+minimum+'" max="'+maximum+'" required')+
-          (approved?.offer_id===offer.id?'<p>Согласованная скидка '+num(approved.rate)+'%</p>':'')+
-          '<div class="row"><button class="primary" name="kind" value="invoice">Получить счёт</button><button name="kind" value="proposal">Получить КП</button></div>'):'')+'</article>';
+        (url?'<a class="chat-icon" href="'+attr(url)+'" target="_blank" rel="noreferrer" aria-label="Карточка на сайте" title="Карточка на сайте">'+icon('external')+'</a>':'')+'</div></div></article>';
     },catalogSearch?.query?'Товары не найдены. Уточните запрос.':'Товаров пока нет.')+'</div>'+pagination+'</section>';
 }
 function cartControls(offer, line) {
@@ -490,10 +534,16 @@ function cartControls(offer, line) {
 }
 function cartPage() {
   const cart = [...clientContext().cart.values()];
+  const totals=new Map();
+  for (const {offer,quantity} of cart) {
+    totals.set(offer.currency,(totals.get(offer.currency) ?? 0)+Math.round(offer.price*100)*quantity);
+  }
   return '<section class="panel" aria-label="Корзина">'+rows(cart, ({offer,quantity}) => item(displayText(offer.name),
+    '<p>'+offerPrice(offer,false)+' за шт. · Сумма '+num(Math.round(offer.price*100)*quantity/100)+' '+escape(offer.currency)+'</p>'+
     '<div class="row">'+cartControls(offer,{offer,quantity})+button('Удалить','cart-remove',offer.id)+
     iconButton('question','Спросить о товаре','ask-cart-product',offer.id)+'</div>'),
-  'В корзине пока ничего нет. Добавьте товар из каталога.')+'</section>';
+  'В корзине пока ничего нет. Добавьте товар из каталога.')+
+  (totals.size?'<p role="status"><strong>Итого '+[...totals].map(([currency,total])=>num(total/100)+' '+escape(currency)).join(' + ')+'</strong></p>':'')+'</section>';
 }
 function documentDescription(d) {
   const name=d.name ?? d.product_name ?? d.filename ?? '';
@@ -533,19 +583,46 @@ function staffPage() {
   return {title:developer?'Управление поддержкой':label(role),html:mode+(tabs.length>1?choices(tabs,'tab',current):'')+'<div class="form">'+modules[current]()+'</div>'};
 }
 const selectDialogLabel = d => list(d.messages).find(m=>messageRole(m)==='buyer')?.text?.slice(0,100) ?? ('Обращение '+d.id);
+let telegramOpen=false;
+const managerKey=()=> 'softline/'+session.role+'/'+role+'/';
+const alertsEnabled=()=>window.Notification?.permission==='granted' && localStorage.getItem(managerKey()+'alerts')==='on';
+const revision=d=>list(d.messages).filter(m=>messageRole(m)==='buyer').at(-1)?.id || 'assigned';
+const readKey=d=>managerKey()+'read/'+d.id;
+function managerList(dialogs) {
+  const groups=[];
+  for (const resolved of [false,true]) {
+    const entries=dialogs.filter(d=>(d.status==='resolved')===resolved).reverse();
+    const title=resolved?'Решённые':'Нерешённые';
+    groups.push('<h3>'+title+' <small>'+entries.length+'</small></h3>'+entries.map(d=>{
+      const unread=localStorage.getItem(readKey(d))!==revision(d);
+      return '<button class="order manager-ticket '+(resolved?'closed':'pending')+'" data-do="dialog" data-value="'+attr(d.id)+'" aria-pressed="'+(d.id===dialogId)+'"><b>'+escape(selectDialogLabel(d))+'</b><small>'+escape(d.id)+(unread?' <strong>Непрочитано</strong>':'')+'</small></button>';
+    }).join(''));
+  }
+  const waiting=list(state.queue);
+  if (waiting.length) groups.splice(1,0,'<h3>Общая очередь <small>'+waiting.length+'</small></h3>'+waiting.map(x=>item(x.reason || 'Запрос покупателя','<p>'+escape(x.id)+'</p>'+button('Взять обращение','claim',x.id))).join(''));
+  return '<div class="manager-list">'+groups.join('')+'</div>';
+}
 function queuePage() {
   const dialogs = list(state.dialogs);
   const d = activeDialog();
   const manager = state.managers?.[role] ?? list(state.managers).find(m=>(m.id ?? m.role)===role);
   const learning=training || role==='developer';
-  let queue = manager && !learning ? '<p>'+(manager.available?'На линии':'Не на линии')+'</p>'+button(manager.available?'Уйти с линии':'Выйти на линию','availability',!manager.available):'';
-  if (!learning && state.telegram) queue += telegramSettings();
-  queue += rows(dialogs,x=>'<button type="button" class="order" data-do="dialog" data-value="'+attr(x.id)+'" aria-pressed="'+(d?.id===x.id)+'"><b>'+escape(selectDialogLabel(x))+'</b><small>'+escape(label(x.status))+' · '+escape(label(x.assignment ?? 'Без назначения'))+'</small></button>','В очереди пока нет обращений.');
-  if (!learning) queue += list(state.queue).filter(x=>!dialogs.some(y=>y.id===x.id)).map(x=>item('В общей очереди',
-    '<p>'+escape(x.id)+' · '+escape(x.route?.reason ?? x.reason)+'</p>'+button('Взять обращение','claim',x.id))).join('');
+  if (!learning && d && !document.hidden) localStorage.setItem(readKey(d),revision(d));
+  let queue = learning ? rows(dialogs,x=>'<button type="button" class="order" data-do="dialog" data-value="'+attr(x.id)+'" aria-pressed="'+(d?.id===x.id)+'"><b>'+escape(selectDialogLabel(x))+'</b><small>'+escape(label(x.status))+' · '+escape(label(x.assignment ?? 'Без назначения'))+'</small></button>','В очереди пока нет обращений.') : managerList(dialogs);
+  if (!learning) {
+    const online=manager?.available;
+    const enabled=alertsEnabled();
+    queue+='<div class="manager-tools"><span>'+(online?'На линии':'Не на линии')+'</span>'+
+      iconButton('send','Настройки Telegram','telegram-settings')+
+      iconButton('bell',enabled?'Выключить уведомления':'Включить уведомления','browser-alerts','',enabled?'enabled':'')+
+      iconButton('power',online?'Уйти с линии':'Выйти на линию','availability',!online,online?'enabled':'')+'</div>'+
+      (telegramOpen ? telegramSettings() : '');
+  }
   let detail = conversation(d,true);
   if (d) {
     detail = '<p class="muted">'+escape(label(d.status))+' · '+escape(label(d.assignment ?? 'Без назначения'))+'</p>'+
+      (d.handoff_summary?'<details open><summary>Кратко об обращении</summary><p>'+escape(d.handoff_summary).replaceAll('\n','<br>')+'</p></details>':'')+
+      (d.outcome?button('Итоги диалога','dialog-result',d.id):'')+
       (learning && d.route?'<details><summary>Маршрутизация</summary>'+routeDetails(d.route)+'</details>':'')+
       (!learning?'<details><summary>Данные заказа</summary>'+rows(list(d.linked_orders),o=>item(o.name,'<p>'+escape(o.id)+' · '+escape(o.status)+' · '+escape(o.license_status)+'</p>'),'В чате пока нет связанного заказа.')+'</details>':'')+'<div class="staff-thread">'+detail+'</div>';
     if (!learning && d.status!=='resolved') {
@@ -560,12 +637,10 @@ function queuePage() {
       (result?.text?'<p>'+escape(result.text)+'</p>':'')+'</details>'+
       '<details><summary>Разметка чата</summary>'+annotationForm('moderate','dialog_id',d)+'</details>';
   }
-  return '<div class="grid">'+panel('Очередь чатов',queue)+panel('Переписка',detail)+'</div>';
+  return '<div class="grid">'+panel(learning?'Очередь чатов':'Переданные диалоги',queue)+panel('Переписка',detail)+'</div>';
 }
 function telegramSettings() {
-  const {available, expires} = state.telegram;
-  const open = app.querySelector('.telegram-settings')?.dataset.role===role &&
-    app.querySelector('.telegram-settings').open;
+  const {available, expires} = state.telegram || {};
   const until = expires && new Intl.DateTimeFormat('ru-RU',{dateStyle:'short',timeStyle:'short',timeZone:'Europe/Moscow'})
     .format(new Date(expires*1000));
   const body = expires
@@ -573,8 +648,7 @@ function telegramSettings() {
     : available ? '<p>Отправьте /start в личном чате с <a href="https://t.me/jtd_test_bot" target="_blank" rel="noreferrer">@jtd_test_bot</a>. Код действует 5 минут.</p>'+
         form('telegram_connect',field('Код из Telegram','code','','inputmode="numeric" pattern="[0-9]{10}" maxlength="10" required autocomplete="off"')+submit('Подключить'))
       : '<p>Бот сейчас недоступен. Обновите обращения позже.</p>';
-  return '<details class="telegram-settings" data-role="'+attr(role)+'"'+(open?' open':'')+'>'+
-    '<summary>Уведомления в Telegram</summary>'+body+'</details>';
+  return '<section class="telegram-settings"><h3>Уведомления в Telegram</h3>'+body+'</section>';
 }
 function routeDetails(route) {
   if (typeof route==='string') return '<p>'+escape(route)+'</p>';
@@ -747,9 +821,12 @@ app.addEventListener('submit', event => {
       const context = clientContext();
       if (referenceDraft) {
         p.reference={type:referenceDraft.type,id:referenceDraft.id};
-      } else if (tab==='cart' || /корзин/i.test(p.text)) {
+      }
+      if ((!referenceDraft && (tab==='cart' || /корзин/i.test(p.text))) ||
+          (referenceDraft?.fromCart && context.cart.has(referenceDraft.id))) {
         p.page_context={type:'basket',items:[...context.cart.values()].map(({offer,quantity})=>({offer_id:String(offer.id),quantity}))};
-      } else if ((!tab || tab==='catalog') && context.viewed) {
+        if (referenceDraft?.fromCart) p.page_context.selected_offer_id=referenceDraft.id;
+      } else if (!referenceDraft && (!tab || tab==='catalog') && context.viewed) {
         if (context.viewed.group_name) p.viewed_group_id=String(context.viewed.group_id);
         else p.viewed_offer_id=String(context.viewed.id);
       }
@@ -771,8 +848,7 @@ app.addEventListener('submit', event => {
       delete p.kind;
       if (dialogId) p.dialog_id=dialogId;
       await act(kind,p);
-      if (result.document) { chatOpen=false; tab='payments'; selectedOffer=''; }
-      else if (result.dialog) chatOpen=true;
+      checkoutOffer=undefined;
       return;
     }
     if (action==='search') { await loadCatalog(p.query.trim(),1); return; }
@@ -783,9 +859,9 @@ app.addEventListener('submit', event => {
       if (action==='message' && messageRole(list(result.dialog?.messages).at(-1) ?? {})==='assistant') notifyMessage();
     }
   }, event.submitter, ()=>{
-    if (action==='telegram_connect') app.querySelector('.telegram-settings summary')?.focus();
+    if (action==='telegram_connect') app.querySelector('[data-do=telegram-settings]')?.focus();
     if (action==='search') app.querySelector('.catalog-search input')?.focus();
-    app.querySelector('[data-action="'+action+'"] textarea')?.focus();
+    app.querySelector('[data-action="'+(action==='document'?'message':action)+'"] textarea')?.focus();
     const thread=app.querySelector(action==='reply'?'.staff-thread':'.thread');
     if (thread) thread.scrollTop=thread.scrollHeight;
   });
@@ -803,7 +879,7 @@ app.addEventListener('pointerdown',event=>{
   selectedQuote=reply?selectedExcerpt(reply):'';
 });
 document.addEventListener('click', event => {
-  if (chatOpen && storefront() && !event.target.closest('.widget, .buyer-layout, .shop')) {
+  if (chatOpen && storefront() && !event.target.closest('.widget, .buyer-layout, .shop, .dialog-result')) {
     chatOpen=false;
     chatPane='';
     const widget=app.querySelector('.widget');
@@ -840,7 +916,18 @@ document.addEventListener('click', event => {
     audioContext?.resume().catch(()=>{});
   }
   if (action==='clear-history' && !window.confirm('Убрать чаты этого клиента из истории и очереди?')) return;
-  if (action==='end-chat' && !window.confirm('Завершить консультацию? Переписка сохранится в «Моих обращениях».')) return;
+  if (action==='continue-chat') {
+    if (busy) return;
+    chatPane='continue';
+    if (checkoutOffer) {
+      checkoutOffer=undefined;
+      render();
+    } else {
+      control.parentElement.remove();
+    }
+    app.querySelector('.widget [data-action="message"] textarea')?.focus();
+    return;
+  }
   if (action==='suggest') {
     const input=app.querySelector('[data-action="message"] textarea');
     input.value=value;
@@ -862,7 +949,12 @@ document.addEventListener('click', event => {
         token='';
         break;
       case 'catalog-day': await act('feed_import',{day:Number(value),request_id:crypto.randomUUID()}); break;
-      case 'chat-choice': await act('message',{dialog_id:dialogId,text:value,mode:'rules',request_id:control.dataset.requestId ??= crypto.randomUUID()}); break;
+      case 'chat-choice':
+        if (value==='Позвать менеджера') {
+          await act('handoff',{dialog_id:dialogId,text:value,request_id:control.dataset.requestId ??= crypto.randomUUID()});
+          break;
+        }
+        await act('message',{dialog_id:dialogId,text:value,mode:'rules',request_id:control.dataset.requestId ??= crypto.randomUUID()}); break;
       case 'context-question': {
         const offer=clientContext().viewed;
         const reference=referenceDraft ?? {type:offer.group_name?'group':'offer',id:String(offer.group_id ?? offer.id)};
@@ -884,7 +976,7 @@ document.addEventListener('click', event => {
         break;
       }
       case 'open-chat': chatOpen=launcherSeen=true; break;
-      case 'close-chat': chatOpen=false; chatPane=''; break;
+      case 'close-chat': chatOpen=false; chatPane=''; checkoutOffer=undefined; break;
       case 'chat-options': chatPane=chatPane==='options'?'':'options'; break;
       case 'chat-history': chatPane='history'; break;
       case 'chat-thread': chatPane=''; break;
@@ -904,7 +996,11 @@ document.addEventListener('click', event => {
       case 'clear-quote': quoteDraft=undefined; break;
       case 'clear-file': fileDraft=undefined; break;
       case 'clear-reference': referenceDraft=undefined; break;
-      case 'end-chat': await act('end_chat',{dialog_id:value}); clearComposer(); chatPane=''; break;
+      case 'end-chat': chatPane='confirm'; break;
+      case 'confirm-resolved': await act('end_chat',{dialog_id:value,confirmed:true}); clearComposer(); chatPane=''; break;
+      case 'dialog-result': showDialogResult(activeDialog()); break;
+      case 'call-manager': await act('handoff',{dialog_id:value,text:'Позвать менеджера',request_id:control.dataset.requestId ??= crypto.randomUUID()}); chatPane=''; break;
+      case 'night-transfer': await act('handoff',{dialog_id:value,simulate_night:true}); chatPane=''; break;
       case 'clear-history': await act('clear_history',{}); clearComposer(); dialogId=undefined; chatPane=''; break;
       case 'logout':
         if (telegramEnabled || telegramSession && session?.role==='jury') {
@@ -931,7 +1027,7 @@ document.addEventListener('click', event => {
         if (value===role) break;
         {
           const next = await roleState(value);
-          resetWorkspace(); role=value; state=next; result=dialogId=tab=undefined; samplePage=0; sampleQuery=''; selectedOffer='';
+          resetWorkspace(); role=value; state=next; result=dialogId=tab=undefined; samplePage=0; sampleQuery='';
         }
         break;
       case 'tab': tab=value; result=undefined; break;
@@ -951,7 +1047,8 @@ document.addEventListener('click', event => {
         const title=kind==='order'?'Заказ '+record.id+' · '+record.name :
           kind==='document'?(label(record.kind ?? record.type)||'Документ')+' '+(record.number ?? record.id) :
           record.group_name || record.name;
-        referenceDraft={type,kind:kind==='cart-product'?'cart':type,id:String(type==='group'?record.group_id:record.id),label:title};
+        checkoutOffer=undefined;
+        referenceDraft={type,fromCart:kind==='cart-product',id:String(type==='group'?record.group_id:record.id),label:title};
         chatOpen=launcherSeen=true;
         chatPane='';
         break;
@@ -1005,13 +1102,13 @@ document.addEventListener('click', event => {
       case 'cart-remove': clientContext().cart.delete(value); break;
       case 'workspace': training=value==='training'; tab=result=undefined; clearComposer(); break;
       case 'dialog': dialogId=value; result=undefined; clearComposer(); break;
-      case 'open-dialog': clearComposer(); dialogId=value; chatOpen=true; chatPane=''; result=undefined; break;
-      case 'new-dialog': clearComposer(); dialogId=''; chatOpen=true; chatPane=''; result=undefined; break;
+      case 'open-dialog': clearComposer(); checkoutOffer=undefined; dialogId=value; chatOpen=true; chatPane=''; result=undefined; break;
+      case 'new-dialog': clearComposer(); checkoutOffer=undefined; dialogId=''; chatOpen=true; chatPane=''; result=undefined; break;
       case 'chat-offer': {
-        const offer=list(activeDialog()?.messages).flatMap(m=>list(m.offers)).find(o=>String(o.id)===value);
-        if (offer) { chatOpen=false; tab='catalog'; selectedOffer=value; clientContext().viewed=offer; result={offers:[offer]}; }
+        checkoutOffer=list(activeDialog()?.messages).flatMap(m=>list(m.offers)).findLast(o=>String(o.id)===value);
         break;
       }
+      case 'cancel-checkout': checkoutOffer=undefined; break;
       case 'sample-page': samplePage=Number(value); break;
       case 'price-request': {
         await act('price_request',{offer_id:value,dialog_id:activeDialog()?.status==='resolved'?'':dialogId,
@@ -1038,6 +1135,13 @@ document.addEventListener('click', event => {
         }
         break;
       }
+      case 'telegram-settings': telegramOpen=!telegramOpen; break;
+      case 'browser-alerts':
+        if (!window.Notification || !navigator.serviceWorker) throw Error('Этот браузер не поддерживает уведомления.');
+        if (alertsEnabled()) localStorage.removeItem(managerKey()+'alerts');
+        else if (await Notification.requestPermission()==='granted') localStorage.setItem(managerKey()+'alerts','on');
+        else throw Error('Разрешите уведомления в настройках сайта.');
+        break;
       case 'availability': await act(action,{available:value==='true'}); break;
       case 'rate': await act('review',{dialog_id:dialogId,message_id:value,rating:control.dataset.rating}); break;
       case 'claim':
@@ -1049,6 +1153,14 @@ document.addEventListener('click', event => {
       case 'template_rollback': await act(action,{template_id:value}); break;
     }
   },control,()=>{
+    if (action==='chat-offer') {
+      app.querySelector('[data-action="document"] input[type="number"], [data-action="document"] button[name="kind"]')?.focus();
+      return;
+    }
+    if (action==='cancel-checkout') {
+      app.querySelector('.widget textarea')?.focus();
+      return;
+    }
     if (action==='catalog-page') {
       app.querySelector('.catalog-search input')?.focus();
       return;
@@ -1057,8 +1169,9 @@ document.addEventListener('click', event => {
       app.querySelector('.composer-line textarea')?.focus();
       return;
     }
-    if (action==='dialog') {
+    if (action==='dialog' || action==='claim') {
       const thread=app.querySelector('.staff-thread');
+      thread?.closest('.panel')?.scrollIntoView({block:'start'});
       if (thread) thread.scrollTop=thread.scrollHeight;
     }
     if (chatOpen && (action.startsWith('ask-') || ['open-chat','choose-group','starter','new-dialog','open-dialog'].includes(action))) {
@@ -1114,11 +1227,40 @@ document.addEventListener('keydown',event=>{
     if (!event.repeat && !busy && (event.target.value.trim() || fileDraft)) event.target.form.requestSubmit();
     return;
   }
-  if (event.key==='Escape' && chatOpen) app.querySelector('[data-do="close-chat"]')?.click();
+  if (event.key==='Escape' && chatOpen && !document.querySelector('.dialog-result[open]')) app.querySelector('[data-do="close-chat"]')?.click();
 });
 // Update the open conversation without replacing a draft or stealing focus.
 let checkingChat=false;
 setInterval(async ()=>{
+  if (app.querySelector('.manager-list') && !checkingChat && !busy) {
+    checkingChat=true;
+    const before=state;
+    try {
+      const next=await roleState(role);
+      if (before!==state || busy || !app.querySelector('.manager-list')) return;
+      const changed=list(next.dialogs).filter(d=>{
+        const prior=list(before.dialogs).find(x=>x.id===d.id);
+        return !prior || revision(prior)!==revision(d);
+      });
+      const added=list(next.queue).filter(x=>!list(before.queue).some(y=>x.id===y.id));
+      if (alertsEnabled() && (added.length || changed.some(d=>document.hidden || d.id!==dialogId))) {
+        const worker=await navigator.serviceWorker.getRegistration();
+        if (worker) await worker.showNotification('Новое обращение или сообщение',{tag:'manager-queue'});
+      }
+      if (before!==state || busy) return;
+      const previous=activeDialog();
+      state=next;
+      const current=activeDialog();
+      if (current && !document.hidden) localStorage.setItem(readKey(current),revision(current));
+      const node=app.querySelector('.manager-list');
+      if (!node) return;
+      const markup=managerList(list(next.dialogs));
+      if (node.outerHTML!==markup && !node.contains(document.activeElement)) node.outerHTML=markup;
+      if (JSON.stringify(previous)!==JSON.stringify(current)) render();
+    } catch (error) { if (!session) showError(error); }
+    finally { checkingChat=false; }
+    return;
+  }
   const previous=activeDialogSafe();
   if (!previous || checkingChat || busy || document.hidden) return;
   const before=state;

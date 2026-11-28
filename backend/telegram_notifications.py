@@ -32,6 +32,8 @@ class ManagerNotifications:
             db.execute("""CREATE TABLE IF NOT EXISTS telegram_outbox(
                 id INTEGER PRIMARY KEY, scope TEXT, role TEXT, chat INTEGER, expires INTEGER)""")
             db.execute("CREATE TABLE IF NOT EXISTS telegram_cursor(id INTEGER PRIMARY KEY, offset INTEGER)")
+            if "dialog_id" not in {row[1] for row in db.execute("PRAGMA table_info(telegram_outbox)")}:
+                db.execute("ALTER TABLE telegram_outbox ADD COLUMN dialog_id TEXT")
 
     def session_action(self, session, scope, role, action, code=None):
         now = int(time.time())
@@ -99,13 +101,13 @@ class ManagerNotifications:
         return {(entry["id"], entry["assignment"]) for entry in state["dialogs"].values()
                 if entry["status"] == "assigned" and entry["assignment"] in MANAGER_ROLES}
 
-    def enqueue(self, db, scope, roles):
+    def enqueue(self, db, scope, assignments):
         now = int(time.time())
-        for role in roles:
-            db.execute("""INSERT INTO telegram_outbox(scope, role, chat, expires)
-                SELECT scope, role, chat, ? FROM telegram_sessions
+        for dialog_id, role in assignments:
+            db.execute("""INSERT INTO telegram_outbox(scope, role, chat, expires, dialog_id)
+                SELECT scope, role, chat, ?, ? FROM telegram_sessions
                 WHERE scope=? AND role=? AND expires>? GROUP BY scope, role, chat""",
-                (now + CODE_LIFETIME, scope, role, now))
+                (now + CODE_LIFETIME, dialog_id, scope, role, now))
 
     def flush(self):
         now = int(time.time())
@@ -117,11 +119,14 @@ class ManagerNotifications:
                 ORDER BY id LIMIT 20""").fetchall()
         for (item,) in items:
             with self.storage.connect(write=True) as db:
-                notice = db.execute("DELETE FROM telegram_outbox WHERE id=? RETURNING scope, role, chat",
+                notice = db.execute("DELETE FROM telegram_outbox WHERE id=? RETURNING scope, role, chat, dialog_id",
                                     (item,)).fetchone()
                 if not notice:
                     continue
-                scope, role, chat = notice
+                scope, role, chat, dialog_id = notice
+                dialog = self.storage.read(db, scope).get("dialogs", {}).get(dialog_id, {})
+                if dialog_id and (dialog.get("assignment") != role or dialog.get("status") != "assigned"):
+                    continue
                 active = db.execute("""SELECT 1 FROM telegram_sessions
                     WHERE scope=? AND role=? AND chat=? AND expires>?""",
                     (scope, role, chat, int(time.time()))).fetchone()
@@ -129,7 +134,8 @@ class ManagerNotifications:
                 manager = "Менеджер 1" if role == "manager1" else "Менеджер 2"
                 try:
                     self.call("sendMessage", {"chat_id": chat,
-                              "text": f"Softline · {manager}\nВам назначено новое обращение. Откройте очередь чатов на стенде."})
+                              "protect_content": True,
+                              "text": f"Softline · {manager}\nВам назначено новое обращение.\n{dialog.get('handoff_summary', '')}".strip()})
                 except RuntimeError:
                     print(f"Telegram assignment notification failed (item {item})", file=sys.stderr, flush=True)
 

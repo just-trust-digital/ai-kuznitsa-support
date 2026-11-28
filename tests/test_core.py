@@ -716,5 +716,152 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(captured), 4)
 
 
+class StatedTaskAndFallbacks(unittest.TestCase):
+    """Cases from the answer-quality audit: stated tasks, soft filters, dead ends."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.store = Store(self.directory / "demo.db")
+        self.scope = "audit-scope"
+
+    def act(self, action, **payload):
+        return self.store.act("buyer", action, payload, self.scope)
+
+    def chat(self, texts):
+        dialog_id, rows = None, []
+        for text in texts:
+            payload = dict(text=text, mode="rules")
+            if dialog_id:
+                payload["dialog_id"] = dialog_id
+            dialog = self.act("message", **payload)["dialog"]
+            dialog_id = dialog["id"]
+            rows.append((text, dialog["messages"][-1], dialog.get("decision", {})))
+        return rows
+
+    def test_guided_trigger_uses_task_from_same_message(self):
+        rows = self.chat(["Помогите подобрать программу для работы с документами",
+                          "Нас 20 человек", "Windows"])
+        first_reply = rows[0][1]["text"]
+        self.assertNotEqual(first_reply, "Какую задачу вы хотите решить с помощью программы?")
+        self.assertEqual(rows[0][2]["missing"], ["seats"])
+        self.assertNotEqual(rows[1][1]["text"], "Сколько человек будут пользоваться программой?")
+        self.assertEqual(rows[1][2]["missing"], ["platform"])
+        self.assertEqual(rows[2][2]["facets"]["seats"], 20)
+        self.assertEqual(rows[2][2]["facets"]["platforms"], ["windows"])
+        self.assertNotIn(rows[0][1]["text"], (rows[1][1]["text"], rows[2][1]["text"]))
+
+    def test_need_phrase_without_product_starts_guided_selection(self):
+        rows = self.chat(["Нужна почта на домене", "на 15 человек", "linux"])
+        self.assertEqual(rows[0][2]["missing"], ["seats"])
+        self.assertEqual(rows[1][2]["facets"]["seats"], 15)
+        last_reply, decision = rows[2][1], rows[2][2]
+        self.assertEqual(decision["next_action"], "shortlist")
+        self.assertTrue(any("MDaemon" in name for name in
+                            (offer["name"] for offer in last_reply.get("offers", []))))
+
+    def test_perpetual_preference_relaxes_to_nearest_cards(self):
+        _, reply, decision = self.chat(["Нужен MDaemon на 20 пользователей. Лицензия бессрочная?"])[0]
+        self.assertEqual(decision["next_action"], "clarify")
+        self.assertEqual(decision["missing"], ["license_term"])
+        self.assertIn("demo-mdaemon-20", decision["evidence"])
+        self.assertTrue(any(offer["id"] == "demo-mdaemon-20" for offer in reply.get("offers", [])))
+
+    def test_availability_routes_catalog_or_manager(self):
+        _, reply, decision = self.chat(["Есть ли в наличии Dr.Web для рабочих станций?"])[0]
+        self.assertEqual(decision["next_action"], "shortlist")
+        self.assertTrue(any(offer["id"] == "demo-drweb" for offer in reply.get("offers", [])))
+        # An unknown product asks for the article to check the supply term.
+        _, reply, decision = self.chat(["Когда будет поставка Astra Linux?"])[0]
+        self.assertEqual(decision["next_action"], "clarify")
+        self.assertEqual(decision["missing"], ["article"])
+        self.assertIn("артикул", reply["text"])
+
+    def test_compatibility_with_named_platform_hands_off_instead_of_reasking(self):
+        _, reply, decision = self.chat(["КриптоПро CSP будет работать на Windows 11?"])[0]
+        self.assertEqual(decision["next_action"], "handoff")
+        self.assertFalse(reply.get("offers"))
+        self.assertNotIn("На каких устройствах", reply["text"])
+
+    def test_dead_ends_offer_manager_choice(self):
+        _, reply, decision = self.chat(["Сколько стоит Windows 11?"])[0]
+        self.assertEqual(decision["next_action"], "refine_search")
+        self.assertIn("Позвать менеджера", reply.get("choices", []))
+        _, reply, decision = self.chat(["Добрый день, подскажите"])[0]
+        self.assertEqual(decision["missing"], ["intent"])
+        self.assertIn("Позвать менеджера", reply.get("choices", []))
+
+    def test_commercial_request_counts_as_document(self):
+        _, reply, decision = self.chat(["Нужен коммерческий запрос на Касперского, 15 пользователей"])[0]
+        self.assertEqual(decision["intent"], "document")
+        self.assertEqual(decision["facets"]["seats"], 15)
+
+
+class GroundedModelPublishing(unittest.TestCase):
+    """The generator reply is published only when grounded in the supplied evidence."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.scope = "model-scope"
+
+    def store_with(self, engine):
+        return Store(self.directory / f"{id(engine)}.db", engine=engine)
+
+    @staticmethod
+    def structured_engine(answer_text):
+        class Engine:
+            def answer(self, text, context=""):
+                evidence = json.loads(context)
+                offer = evidence["offers"][0]
+                payload = {"answer": answer_text.format(name=offer["name"], price=offer["price"],
+                                                        currency=offer["currency"], url=offer["url"]),
+                           "sources": [offer["url"]]}
+                return dict(text=json.dumps(payload, ensure_ascii=False), structured=payload,
+                            mode="local", verified_model=True, route="technical",
+                            decision_intent="named_product", decision_probability=.93,
+                            needs_clarification=False)
+        return Engine()
+
+    def chat(self, store, text="Нужен MDaemon на 20 пользователей"):
+        return store.act("buyer", "message", dict(text=text, mode="local"), self.scope)["dialog"]
+
+    def test_grounded_answer_replaces_scenario_text(self):
+        engine = self.structured_engine(
+            "{name} стоит {price:g} {currency}. Добавьте товар в корзину и оформите заказ.")
+        dialog = self.chat(self.store_with(engine))
+        reply = dialog["messages"][-1]
+        self.assertEqual(reply["mode"], "local")
+        self.assertTrue(reply["model"]["published"])
+        self.assertIn("19200", reply["text"])
+        self.assertNotIn("менеджер", reply["text"].lower())
+
+    def test_invented_price_and_manager_referral_are_not_published(self):
+        store = self.store_with(self.structured_engine(
+            "{name} стоит 99999 {currency}. Обратитесь к менеджеру за деталями."))
+        dialog = self.chat(store)
+        reply = dialog["messages"][-1]
+        self.assertEqual(reply["mode"], "rules")
+        self.assertFalse(reply["model"].get("published"))
+
+    def test_manager_only_answer_is_rejected_without_numbers(self):
+        engine = self.structured_engine("Уточните количество рабочих мест у {name}.")
+        dialog = self.chat(self.store_with(engine))
+        reply = dialog["messages"][-1]
+        self.assertEqual(reply["mode"], "local")
+        self.assertIn("Уточните количество", reply["text"])
+
+    def test_computed_total_from_supported_numbers_is_published(self):
+        engine = self.structured_engine(
+            "{name} стоит {price:g} {currency}; для 20 лицензий итого 384000 {currency}.")
+        dialog = self.chat(self.store_with(engine), text="Нужен MDaemon на 20 пользователей")
+        reply = dialog["messages"][-1]
+        self.assertEqual(reply["mode"], "local")
+        self.assertTrue(reply["model"]["published"])
+        self.assertIn("384000", reply["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

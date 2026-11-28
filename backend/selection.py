@@ -96,8 +96,8 @@ def facets_for(text):
     folded = text.casefold().replace("ё", "е")
     facets = {}
     seats = re.search(QUANTITY + COUNT_MODIFIERS
-                      + r"(?:пользовател|устройств|сотрудник|компьютер|подключени|мест\b|рабочих мест|"
-                        r"рабочих станц|персональн\w*\s+компьютер|планшет|пк\b|кпк\b)", folded)
+                      + r"(?:пользовател|устройств|сотрудник|компьютер|челове[кца]|юзер\w*|подключени|мест\b|"
+                        r"рабочих мест|рабочих станц|персональн\w*\s+компьютер|планшет|пк\b|кпк\b)", folded)
     items = re.search(QUANTITY + COUNT_MODIFIERS + r"(?:лиценз|экземпляр|штук|планшет|подключени)", folded)
     if not items:
         items = re.search(r"\bлиценз\w*\s+(?:(?:надо|нужн[оы]|требуется)\s+)?" + COUNT + r"\b", folded)
@@ -237,6 +237,15 @@ def canonical_product(product):
     return product
 
 
+TASK_HINT = re.compile(r"\b(?:для\s+(?!\d)[а-яёa-z]|чтобы\s+[а-яёa-z]|задач\w*)", re.I)
+
+
+def task_phrase(text):
+    """The request itself names the task; otherwise the agent must ask for it."""
+    folded = catalogue_text(text).casefold().replace("ё", "е")
+    return text.strip() if TASK_HINT.search(folded) else ""
+
+
 def product_for(text):
     text = catalogue_text(text)
     folded = text.casefold().replace("ё", "е")
@@ -298,10 +307,14 @@ def classify(text):
                  r"доступ\w*\s+к\s+\d+\s+(?:компьютер|машин|устройств)", folded):
         return "compatibility"
     if re.search(r"(?:выстав\w*|оформ\w*|пришл\w*|подготов\w*|направ\w*|сдела\w*|нуж\w*|получ\w*)"
-                 r"\s+(?:мне\s+|нам\s+)?(?:кп\b|коммерческ\w+ предлож)|"
-                 r"^\s*(?:кп\b|коммерческ\w+ предлож\w*)\s+на\b|"
+                 r"\s+(?:мне\s+|нам\s+)?(?:кп\b|коммерческ\w+\s+(?:предлож|запрос|расчёт|оферту?))|"
+                 r"^\s*(?:кп\b|коммерческ\w+\s+(?:предлож\w*|запрос|расчёт|оферту?))\s+на\b|"
                  r"(?:выстав\w*|оформ\w*|пришл\w*|сдела\w*|нуж\w*)\s+(?:мне\s+|нам\s+)?счет", folded):
         return "document"
+    if re.search(r"\b(?:в\s+наличи|наличи[еяи])\b|"
+                 r"когда\s+(?:будет|появ\w*)\s+(?:в\s+)?(?:поставк|доставк|товар|позици|модель)|"
+                 r"сроки?\s+поставк\w*|поставк\w*.{0,20}(?:когда|срок)", folded):
+        return "availability"
     if any(re.search(r"\bсчет\s+(?:на|по)\b", clause) and not INVOICE_LOOKUP.search(clause)
            for clause in re.split(r"[?\n]+", folded)):
         return "document"
