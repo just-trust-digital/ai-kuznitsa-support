@@ -62,6 +62,7 @@ class RuntimeTests(unittest.TestCase):
         from backend.telegram_bridge import PollingWorker
         with tempfile.TemporaryDirectory() as path:
             store = build_store(path + '/store.db', None, None, path)
+            store.business_hours = lambda: True
             class Model:
                 def answer(self, text, context=''):
                     return {'text': 'Synthetic model response', 'mode': 'local', 'verified_model': True}

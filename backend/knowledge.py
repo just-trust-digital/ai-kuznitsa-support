@@ -27,7 +27,7 @@ PURCHASE_DETAILS = re.compile(
 
 def power_bi_purchase_topics(text, facets, page_context=None):
     product = facets.get("product", "")
-    if facets.get("article") or facets.get("products"):
+    if facets.get("article") or facets.get("articles") or facets.get("products"):
         return set()
     if product and not POWER_BI_NAME.fullmatch(product):
         return set()

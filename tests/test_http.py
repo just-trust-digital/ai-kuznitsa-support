@@ -5,6 +5,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from backend.core import Store
 from backend.runtime import build_store
 from server import Handler, SupportServer, access_file
 
@@ -14,10 +15,12 @@ class TestStandAccess(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
+        self.root = root
         self.tokens = access_file(root)
         self.server = SupportServer(("127.0.0.1", 0), Handler)
         self.server.credentials = self.tokens
         self.server.store = build_store(root / "test.sqlite", None, None, root)
+        self.server.store.business_hours = lambda: True
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(self.server.server_close)
@@ -38,6 +41,32 @@ class TestStandAccess(unittest.TestCase):
         self.assertEqual("no-store", cache)
         return status, content
 
+    def test_minimum_of_one_compound_product(self):
+        name = "Kaspersky Security для Microsoft Office 365 лицензия на 1 год. Количество почтовых ящиков"
+        feed = self.root / "feed.xml"
+        feed.write_text(f'<yml_catalog><shop><offers><offer id="test-365" available="true">'
+                        f'<name>{name}</name><price>10</price><sales_notes>Кол-во от 10 до 14 шт.</sales_notes>'
+                        '</offer></offers></shop></yml_catalog>', "utf-8")
+        self.server.store = Store(self.root / "case.sqlite", feed)
+
+        def send(text, **fields):
+            status, body = self.call("/api/action", "buyer", {"role": "buyer", "action": "message",
+                                    "payload": {"text": text, "mode": "rules", **fields}})
+            self.assertEqual(status, 200)
+            return json.loads(body)["dialog"]
+
+        d = send(name, starter="viewed", offer_id="test-365")
+        self.assertNotIn("products", d["decision"]["facets"])
+        self.assertNotIn("quantity", d["decision"]["facets"])
+        for text in ("Эта самая минимальная версия?", "тут только один товар", "он в начале переписки", "по количеству"):
+            d = send(text, dialog_id=d["id"])
+            self.assertEqual(d["decision"]["evidence"], ["test-365"])
+            self.assertIn("от 10 до 14", d["messages"][-1]["text"])
+        self.assertEqual(d["decision"]["next_action"], "inform")
+        d = send("Эта минимальная редакция?", dialog_id=d["id"])
+        d = send("по функциям", dialog_id=d["id"])
+        self.assertEqual(d["decision"]["next_action"], "handoff")
+
     def test_token_and_role_boundaries(self):
         self.assertEqual(self.call("/api/state")[0], 401)
         self.assertEqual(self.call("/api/state?role=developer", "jury")[0], 403)
@@ -51,6 +80,22 @@ class TestStandAccess(unittest.TestCase):
             status, raw = self.call("/api/state?role=buyer", token)
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(raw)["feed"]["day"], day)
+
+    def test_second_manager_appears_after_booking_in_jury_scope(self):
+        def state(token, role):
+            status, raw = self.call("/api/state?role=" + role, token)
+            self.assertEqual(status, 200)
+            return json.loads(raw)
+
+        self.assertFalse(state("jury", "buyer")["manager2_active"])
+        action = {"role": "buyer", "action": "message", "payload": {
+            "text": "Хочу забронировать лицензии", "mode": "rules",
+        }}
+        status, raw = self.call("/api/action", "jury", action)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["dialog"]["assignment"], "manager2")
+        self.assertTrue(state("jury", "buyer")["manager2_active"])
+        self.assertFalse(state("buyer", "buyer")["manager2_active"])
 
     def test_jury_can_try_guest_without_client_data(self):
         visitor = "guest." + "c" * 64
@@ -90,6 +135,78 @@ class TestStandAccess(unittest.TestCase):
         self.assertEqual(dialog["decision"]["intent"], "basket")
         self.assertIn(second["id"], dialog["decision"]["evidence"])
 
+    def test_message_reference_in_open_chat_is_scoped_to_customer(self):
+        self.tokens["visitor"] = "guest." + "c" * 64
+
+        def act(token, action, **payload):
+            return self.call("/api/action", token, {"role": "guest" if token == "visitor" else "buyer",
+                                                   "action": action, "payload": payload})
+
+        state = json.loads(self.call("/api/state?role=buyer", "buyer")[1])
+        order = state["orders"][0]
+        license = state["licenses"][0]
+        offer = next(row for row in state["offers"] if row["available"])
+        status, body = act("buyer", "invoice", offer_id=offer["id"], expected_price=offer["price"],
+                           quantity=offer.get("min_quantity", 1))
+        self.assertEqual(status, 200, body)
+        document = json.loads(body)["document"]
+        dialog_id = None
+        for kind, record, question in (("offer", offer, "Расскажите подробнее"),
+                                       ("order", order, "Какой статус?"),
+                                       ("document", document, "Где скачать?"),
+                                       ("license", license, "Действует ли?")):
+            status, body = act("buyer", "message", text=question, dialog_id=dialog_id or "",
+                               mode="rules", reference={"type": kind, "id": record["id"]})
+            self.assertEqual(status, 200, body)
+            dialog = json.loads(body)["dialog"]
+            self.assertEqual(dialog["id"], dialog_id or dialog["id"])
+            dialog_id = dialog["id"]
+            reference = dialog["messages"][-2]["reference"]
+            self.assertEqual(set(reference), {"type", "id", "label"})
+            self.assertEqual((reference["type"], reference["id"]), (kind, record["id"]))
+            self.assertIn(record["id"], dialog["decision"]["evidence"])
+            if kind == "offer":
+                self.assertTrue(dialog["messages"][-1]["show_offer_details"])
+            else:
+                self.assertEqual(act("visitor", "message", text=question, reference={"type": kind, "id": record["id"]})[0], 403)
+                self.assertEqual(act("personal", "message", text=question, reference={"type": kind, "id": record["id"]})[0], 404)
+        status, body = self.call("/api/chat?role=buyer&id=" + dialog_id, "buyer")
+        self.assertEqual(status, 200)
+        history = json.loads(body)["dialogs"][0]["messages"]
+        self.assertEqual(sum("reference" in message for message in history), 4)
+
+    def test_guest_task_keeps_priority_over_browsed_catalog_group(self):
+        self.tokens["visitor"] = "guest." + "d" * 64
+        dialog_id = ""
+        for text, missing in (("Помогите с выбором", "task"), ("для юриста чтобы каждый месяц чистил", "seats"), ("1", "platform")):
+            starter = {"starter": "choose"} if not dialog_id else {}
+            status, body = self.call("/api/action", "visitor", {"role": "guest", "action": "message", "payload": {
+                "mode": "rules", "text": text, "dialog_id": dialog_id, "viewed_group_id": "unrelated-group", **starter,
+            }})
+            self.assertEqual(status, 200, body)
+            dialog = json.loads(body)["dialog"]
+            dialog_id = dialog["id"]
+            self.assertEqual(dialog["decision"]["missing"], [missing])
+            self.assertFalse(dialog["messages"][-1].get("offers"))
+
+    def test_guest_basket_follow_up_uses_latest_quantity(self):
+        self.tokens["visitor"] = "guest." + "a" * 64
+        state = json.loads(self.call("/api/state?role=guest", "visitor")[1])
+        offer = next(offer for offer in state["offers"] if offer["available"] and offer["price"])
+        minimum = offer.get("min_quantity", 1)
+        dialog_id = None
+        for text, quantity in (("Сколько стоит корзина?", minimum), ("Сколько теперь стоит?", minimum + 1)):
+            status, body = self.call("/api/action", "visitor", {"role": "guest", "action": "message", "payload": {
+                "mode": "rules", "text": text, "dialog_id": dialog_id or "",
+                "page_context": {"type": "basket", "items": [{"offer_id": offer["id"], "quantity": quantity}]},
+            }})
+            self.assertEqual(status, 200, body)
+            dialog = json.loads(body)["dialog"]
+            dialog_id = dialog["id"]
+            self.assertEqual(dialog["decision"]["intent"], "basket")
+            self.assertIn(offer["id"], dialog["decision"]["evidence"])
+            self.assertIn(f"Итого по каталогу {offer['price'] * quantity:.2f}", dialog["messages"][-1]["text"])
+
     def test_guest_chat_continues_only_for_its_authenticated_customer(self):
         self.tokens.update(visitor="guest." + "a" * 64, other="guest." + "b" * 64)
 
@@ -127,5 +244,5 @@ class TestStandAccess(unittest.TestCase):
         self.assertEqual(status, 200)
         document_id = json.loads(body)["document"]["id"]
         self.assertEqual(action("buyer", "buyer", "download", document_id=document_id)[0], 404)
-        self.assertIn("Марина Орлова", json.loads(action("personal", "buyer", "download",
+        self.assertIn("Марина Тестова", json.loads(action("personal", "buyer", "download",
                                                       document_id=document_id)[1])["content"])

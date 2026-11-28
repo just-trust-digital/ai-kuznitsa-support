@@ -1,5 +1,6 @@
 """Staff review queue and side-effect-free replay inputs."""
 
+from copy import deepcopy
 import hashlib
 import json
 import re
@@ -106,16 +107,59 @@ def log_for(state, role):
     )]
 
 
+def capture_context(dialog):
+    keys = ("facets", "viewed_offer", "viewed_group", "group_request", "decision", "discount_counteroffer",
+            "optional_answers", "guided_selection", "search_by_name", "asked_seats", "asked_platform", "clarification_stalled")
+    return {key: deepcopy(dialog[key]) for key in keys if key in dialog}
+
+
+def trace_steps(messages, fragment):
+    steps = []
+    for message in messages:
+        decision = message.get("decision", {})
+        steps.append(dict(text=redact(message["text"]), fragment=redact(message.get("review_fragment", fragment)),
+                          evidence=[redact(str(e)) for e in decision.get("evidence", [])],
+                          intent=decision.get("intent"),
+                          action=decision.get("next_action"), missing=decision.get("missing", []),
+                          source=source_reference(message.get("source")), template=message.get("template_id")))
+    return steps
+
+
 def replay(state, role, dialog_id, message_id, version, answer):
     item, question, context = lookup(state, role, dialog_id, message_id, version)
-    scenario = {"day": state["day"], "changes": state.get("changes", []),
-                "templates": state["templates"], "orders": {}, "managers": {}, "dialogs": {}}
+    original = state["dialogs"][dialog_id]
+    scenario = deepcopy(state)
+    scenario["buyer_id"] = original.get("buyer_id", "buyer1")
+    original_answer = next(m for m in original["messages"] if m["id"] == message_id)
     staged = dict(id="review-replay", assignment=None, status="open", route=None,
                   messages=[dict(question)], facets=dict(context.get("facets", {})), decision=context)
-    answer(scenario, staged, question["text"])
+    history = original["messages"][:original["messages"].index(question)+1]
+    staged["messages"] = deepcopy(history)
+    if "discount_acceptance" in context.get("missing", []):
+        staged["discount_counteroffer"] = True
+    staged.update(deepcopy(question.get("review_context", {})))
+    # Keep product descriptions and lists of attributes attached to their question.
+    fragments = [part.strip() for part in re.split(
+        r"(?<=[?!])\s+|[,;]\s*(?=(?:а\s+)?(?:как|где|когда|сколько|можно|нужен|дайте)\b)"
+        r"|\s+и\s+(?=(?:как|где|когда|сколько|можно|дадите|подскажите)\b)", question["text"], flags=re.I
+    ) if part.strip()]
+    before = deepcopy(staged) if len(fragments) > 1 else None
+    answer(scenario, staged, question)
+    steps = trace_steps(staged["messages"][len(history):], question["text"])
+    if len(fragments) > 1 and not any(step["fragment"] != item["question"] for step in steps):
+        for fragment in fragments:
+            trial = deepcopy(before)
+            trial["messages"][-1]["text"] = fragment
+            answer(scenario, trial, dict(question, text=fragment))
+            for step in trace_steps(trial["messages"][len(history):], fragment):
+                steps.append(dict(step, separate=True))
+    variants = original_answer.get("review_variants", {})
+    model = original_answer.get("model") or {}
     response = staged["messages"][-1]
     next_action = staged.get("decision", {}).get("next_action")
     result = {key: item[key] for key in ("dialog_id", "message_id", "version", "question")}
+    result.update(steps=steps, variants=variants, original_template=original_answer.get("template_id"),
+                  model_published=bool(model.get("published")), model_failed=bool(model.get("error")))
     result.update(answer="В этом сценарии запрос требует менеджера." if next_action == "handoff"
                   else redact(response["text"]),
                   source=source_reference(response.get("source")), next_action=next_action, mode="rules")

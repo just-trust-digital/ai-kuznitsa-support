@@ -12,11 +12,13 @@ from uuid import uuid4
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
+from . import demo_account
 from .customer import customer_id, is_guest, personal_request
 from .storage import Storage
 from .documents import PROFILES, UNKNOWN, default_templates, printable_date, render_document
 from .basket import basket_request, valid_basket
-from . import reviews
+from . import catalog_groups
+from . import reviews, sales_chat
 from .knowledge import (OFFICE_BUSINESS_NAME, OFFICE_BUSINESS_PAGE, POWER_BI_PAGE, POWER_BI_SOURCE,
                         answers_from_knowledge, asks_edi_status, power_bi_purchase_topics)
 from .integrations import FOLLOW_UP_FIELDS, FOLLOW_UP_TEXT, PROVIDERS, USAGE_FIELDS, follow_up_missing
@@ -40,7 +42,8 @@ MANAGERS = {
     "manager2": {"name": "Менеджер 2", "expertise": ["заказы", "тендер"], "available": True},
 }
 KNOWLEDGE = "https://docs.softline.com/ru-ru/lk"
-VIEWED_DETAILS = re.compile(r"цен[ауые]|сколько стоит|стоимость|подробнее|расскажи|наличи", re.I)
+AVAILABILITY_DETAILS = r"\b(?:наличи\w*|доступ(?:н\w*|ен))"
+VIEWED_DETAILS = re.compile(r"\b(?:цен[ауые]|сколько сто(?:ит|ят)|стоимост\w*|подробнее|расскажи\w*)|" + AVAILABILITY_DETAILS, re.I)
 
 
 def identifier(prefix):
@@ -74,6 +77,14 @@ def string(payload, key, *, optional=False, limit=6000):
     if isinstance(value, str) and len(value) <= limit and (value.strip() or optional):
         return value.strip()
     raise ValueError(f"Проверьте поле {key}")
+
+
+def viewed_facets(offer):
+    facets = facets_for(offer["name"])
+    # A catalogue title describes one SKU. Counts in it are not an order.
+    for key in ("products", "quantity"):
+        facets.pop(key, None)
+    return facets
 
 
 def offer_record(offer_id, name, price, category, url="", description="", currency="RUB", listed=True,
@@ -138,6 +149,8 @@ def catalog_rows(path):
                                    "RUB" if fields.get("currencyId") in {"", None, "RUR"} else fields["currencyId"],
                                    node.get("available") == "true", fields.get("vendorCode", "").strip(), params,
                                    fields.get("vendor", "").strip(), old_price)
+                if node.get("group_id"):
+                    offer["group_id"] = node.get("group_id")
                 bounds = re.search(r"кол-во\s+от\s+(\d+)(?:\s+до\s+(\d+))?\s+шт", fields.get("sales_notes", ""), re.I)
                 if bounds:
                     offer["min_quantity"] = int(bounds[1])
@@ -155,6 +168,7 @@ class Store:
         self.samples = self._read_samples(samples_path)
         self.engine = engine
         self.hybrid_engine = hybrid_engine
+        self.business_hours = None
         self.feed_path = Path(feed_path) if feed_path else None
         if self.feed_path is None or self.feed_path.is_file():
             self.import_catalog()
@@ -179,7 +193,7 @@ class Store:
 
     def import_catalog(self):
         source = str(self.feed_path.resolve()) if self.feed_path else "synthetic"
-        version = f"{source}:{self.feed_path.stat().st_mtime_ns}:v10" if self.feed_path else f"{source}:v3"
+        version = f"{source}:{self.feed_path.stat().st_mtime_ns}:v11" if self.feed_path else f"{source}:v3"
         with self.storage.connect(write=True) as db:
             existing = db.execute("SELECT value FROM catalog WHERE key='version'").fetchone()
             if existing and existing[0] == version:
@@ -235,18 +249,142 @@ class Store:
             offer.update(price=change["price"], available=offer.get("listed", offer["available"]) and change["price"] > 0)
         return offer
 
-    def _search(self, db, state, query="", limit=12):
+    def _search(self, db, state, query="", limit=12, *, by_product=False, offset=0):
         words = re.findall(r"\w+", search_key(query))[:8]
         conditions, args = [], []
         for word in words:
             conditions.append("(name LIKE ? ESCAPE '!' OR category LIKE ? ESCAPE '!')")
             args.extend([f"%{word.replace('_', '!_')}%"] * 2)
         where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        if by_product:
+            availability_first = "available DESC, " if words else ""
+            rows = db.execute(f"""
+                WITH cards AS (
+                    SELECT MIN(id) AS id, MAX(json_extract(body,'$.available')) AS available
+                    FROM offers {where}
+                    GROUP BY COALESCE('group:' || json_extract(body,'$.group_id'), 'offer:' || id)
+                    ORDER BY {availability_first}id LIMIT ? OFFSET ?
+                )
+                SELECT offers.body FROM cards JOIN offers ON offers.id=cards.id
+                ORDER BY {availability_first}cards.id
+            """, [*args, limit, offset])
+            return self._catalog_cards(db, state, [self._offer(row[0], state) for row in rows], limit)
         order = " ORDER BY id"
         if words:
             order = " ORDER BY json_extract(body,'$.available') DESC, id"
         rows = db.execute("SELECT body FROM offers" + where + order + " LIMIT ?", [*args, limit])
         return [self._offer(row[0], state) for row in rows]
+
+    @staticmethod
+    def _group_rows(db, group_id):
+        return db.execute("SELECT body FROM offers WHERE json_extract(body,'$.group_id')=?", (group_id,))
+
+    def _catalog_cards(self, db, state, offers, limit, offset=0):
+        cards, seen = [], set()
+        for offer in offers:
+            group_id = offer.get("group_id")
+            if group_id:
+                if group_id in seen:
+                    continue
+                seen.add(group_id)
+            if offset:
+                offset -= 1
+                continue
+            if group_id:
+                variants = [json.loads(row[0]) for row in self._group_rows(db, group_id)]
+                if len(variants) > 1:
+                    offer = {**offer, "group_name": catalog_groups.group_name(variants)}
+            cards.append(offer)
+            if len(cards) == limit:
+                break
+        return cards
+
+    def _answer_product_group(self, db, state, dialog, text, incoming):
+        offers = [self._offer(row[0], state) for row in self._group_rows(db, dialog["viewed_group"])]
+        explicit_product = named_products(catalogue_text(text).casefold())
+        if incoming.get("article") or incoming.get("articles") or (explicit_product and incoming.get("product") and
+                offers and not any(self._is_primary_product(offer, incoming["product"]) for offer in offers)):
+            dialog.pop("viewed_group", None)
+            dialog.pop("group_request", None)
+            return False
+        if not offers:
+            dialog.pop("viewed_group", None)
+            self._message(dialog, "assistant", "Товар исчез из каталога. Выберите другую карточку.", mode="rules")
+            self._decision(dialog, "product_group", "clarify")
+            return True
+
+        previous = next((m for m in reversed(dialog["messages"]) if m.get("offers")), {})
+        shown_ids = [o["id"] for o in previous.get("offers", []) if o.get("group_recommendation")]
+        by_id = {o["id"]: o for o in offers}
+        shown = [by_id[i] for i in shown_ids if i in by_id]
+        detail = catalog_groups.followup(text, shown)
+        if detail:
+            self._message(dialog, "assistant", detail, mode="rules", source=self._feed(db, state)["source"])
+            self._decision(dialog, "product_group", "inform", evidence=[o["id"] for o in shown])
+            return True
+        parameters = dialog.setdefault("group_request", {})
+        pending = dialog.get("decision", {}).get("missing", [])
+        number = re.fullmatch(r"\s*(\d{1,6})\s*[.!]?\s*", text)
+        if number and not {"quantity", "computers"}.intersection(pending):
+            parameters["ambiguous_number"] = int(number[1])
+            self._message(dialog, "assistant", "Это количество лицензий или номер варианта?",
+                          choices=["Количество лицензий", "Номер варианта"] if shown else ["Количество лицензий"], mode="rules")
+            self._decision(dialog, "product_group", "clarify", missing=["number_meaning"])
+            return True
+        number = parameters.pop("ambiguous_number", None)
+        if number and "number_meaning" in pending:
+            if "количество" in text.casefold():
+                parameters["quantity"] = number
+            elif "вариант" in text.casefold() and 1 <= number <= len(shown):
+                offer = shown[number - 1]
+                self._message(dialog, "assistant", f"Вы выбрали «{offer['name']}».", offers=[offer], mode="rules")
+                self._decision(dialog, "product_group", "inform", evidence=[offer["id"]])
+                return True
+        capacity = catalog_groups.computer_count(text)
+        if number is None and "computers" in pending and text.strip().isdigit():
+            capacity = int(text.strip())
+        if capacity:
+            parameters["computers"] = capacity
+        catalog_groups.update_request(text, incoming, parameters)
+        if capacity and "quantity" not in pending:
+            parameters.pop("quantity", None)
+        constraints = {key: parameters[key] for key in ("architecture", "platforms") if key in parameters}
+        matches = [offer for offer in offers if catalog_groups.matches(offer, parameters) and
+                   self._matches_constraints(offer, constraints)]
+        quantity = parameters.get("quantity")
+        if quantity:
+            matches = [offer for offer in matches if offer.get("min_quantity")] or matches
+        if not matches:
+            self._message(dialog, "assistant", "Под эти условия в каталоге нет варианта. Уточните редакцию или количество.", mode="rules")
+            self._decision(dialog, "product_group", "clarify")
+            return True
+
+        names = {catalog_groups.product_title(offer) for offer in matches}
+        options = sorted(set().union(*(catalog_groups.editions(name) for name in names)))
+        capacities = sorted({n for o in matches if (n := catalog_groups.computer_count(o["name"]))})
+        if len(names) > 1 and len(options) > 1 and not parameters.get("editions"):
+            prompt = catalog_groups.edition_question(options)
+            self._message(dialog, "assistant", prompt, choices=options[:6], mode="rules")
+            self._decision(dialog, "product_group", "clarify", missing=["edition"])
+        elif not quantity and any(offer.get("min_quantity") for offer in matches):
+            self._message(dialog, "assistant", "Сколько лицензий нужно?", mode="rules")
+            self._decision(dialog, "product_group", "clarify", missing=["quantity"])
+        elif len(capacities) > 1 and not parameters.get("computers"):
+            self._message(dialog, "assistant", "На скольких компьютерах вы установите программу?",
+                          choices=[f"{n} ПК" for n in capacities[:6]], mode="rules")
+            self._decision(dialog, "product_group", "clarify", missing=["computers"])
+        else:
+            ranked = sorted(matches, key=lambda offer: (not offer["available"], offer["price"], offer["id"]))
+            distinct = {}
+            for offer in ranked:
+                distinct.setdefault(catalog_groups.product_title(offer), offer)
+            shortlist = [{**offer, "group_recommendation": True, "suggested_quantity": quantity or offer.get("min_quantity", 1)}
+                         for offer in list(distinct.values())[:3]]
+            answer = "Подойдёт эта лицензия." if len(shortlist) == 1 else "Вот варианты под ваши условия."
+            self._message(dialog, "assistant", answer, offers=shortlist, mode="rules", source=self._feed(db, state)["source"])
+            self._decision(dialog, "product_group", "inform" if len(shortlist) == 1 else "shortlist",
+                           evidence=[offer["id"] for offer in shortlist])
+        return True
 
     @staticmethod
     def _can_view(role, dialog, state=None):
@@ -258,14 +396,15 @@ class Store:
 
     @staticmethod
     def _buyer_view(dialog):
-        result = {key: dialog[key] for key in ("id", "assignment", "status", "created_at", "decision", "approved_discount") if key in dialog}
+        result = {key: dialog[key] for key in ("id", "assignment", "status", "created_at", "decision", "approved_discount", "offer_email") if key in dialog}
         if dialog.get("route"):
             result["route"] = {"reason": dialog["route"]["reason"]}
         result["messages"] = []
         for message in dialog["messages"]:
             public = {key: message[key] for key in (
                 "id", "role", "text", "at", "offers", "mode", "source", "decision", "document_id",
-                "evidence", "template_id", "joined", "quote", "attachment",
+                "evidence", "template_id", "joined", "quote", "attachment", "reference", "synthetic", "choices",
+                "show_offer_details",
             ) if key in message}
             if isinstance(message.get("model"), dict):
                 public["model"] = {key: message["model"][key] for key in (
@@ -325,7 +464,16 @@ class Store:
             buyer_id = customer_id(state)
             orders = state["orders"].values() if role == "buyer" else []
             documents = state["documents"].values() if role == "buyer" else []
-            return dict(role=role, buyer_id=buyer_id, feed=self._feed(db, state), offers=self._search(db, state),
+            feed = self._feed(db, state)
+            catalog = self._search(db, state, limit=9, by_product=True) if role == "buyer" else []
+            if role == "buyer":
+                feed.pop("changes", None)
+            return dict(role=role, buyer_id=buyer_id, feed=feed, offers=self._search(db, state),
+                        catalog=catalog[:8], catalog_has_more=len(catalog) > 8,
+                        licenses=demo_account.licenses(buyer_id) if role == "buyer" else [],
+                        manager2_active=scope.startswith("jury") and any(
+                            d["status"] == "assigned" and d["assignment"] == "manager2"
+                            and not d.get("demo_archived") for d in state["dialogs"].values()),
                         handoff_stats=self._handoff_stats(state) if role != "buyer" or scope.startswith("jury") else {},
                         orders=[o for o in orders if o.get("buyer_id", "buyer1") == buyer_id],
                         documents=[self._document_view(d) for d in documents if d.get("buyer_id", "buyer1") == buyer_id],
@@ -373,10 +521,18 @@ class Store:
         self._check(role, scope)
         if not isinstance(payload, dict) or not isinstance(action, str):
             raise ValueError("Ожидаются поля действия")
-        if "viewed_offer_id" in payload:
-            if role != "buyer" or action != "message":
-                raise ValueError("Неизвестный контекст страницы")
-            string(payload, "viewed_offer_id", limit=128)
+        for key in ("viewed_offer_id", "viewed_group_id"):
+            if key in payload:
+                if role != "buyer" or action != "message":
+                    raise ValueError("Неизвестный контекст страницы")
+                string(payload, key, limit=128)
+        if "reference" in payload:
+            reference = payload["reference"]
+            if (role != "buyer" or action != "message" or payload.get("starter")
+                    or not isinstance(reference, dict) or set(reference) != {"type", "id"}
+                    or string(reference, "type") not in ("offer", "group", "order", "document", "license")):
+                raise ValueError("Не удалось прикрепить позицию")
+            string(reference, "id", limit=128)
         if "page_context" in payload:
             context = payload["page_context"]
             if role != "buyer" or action != "message" or (context not in (POWER_BI_PAGE, OFFICE_BUSINESS_PAGE) and not valid_basket(context)):
@@ -415,7 +571,7 @@ class Store:
         mode = payload.get("mode", "local" if chat else "rules")
         if mode not in ("rules", "local", "hybrid"):
             raise ValueError("Неизвестный режим ответа")
-        if mode == "rules" or (chat and payload.get("starter")):
+        if mode == "rules" or (chat and (payload.get("starter") or payload.get("reference"))):
             return None
         text = string(payload, "text", optional=bool(payload.get("attachment"))) if chat else ""
         if chat and not text:
@@ -443,25 +599,31 @@ class Store:
                 if dialog["status"] in {"assigned", "queued"}:
                     return None
             facets, skipped_reply = self._incoming_facets(text, dialog or {})
+            if chat and not payload.get("page_context") and not payload.get("viewed_offer_id") and (
+                    payload.get("viewed_group_id") or (dialog or {}).get("viewed_group")) and not (
+                    facets.get("article") or facets.get("articles")):
+                return None
             known_facets = dict((dialog or {}).get('facets', {}))
             skipped = set((dialog or {}).get('optional_answers', {}))
             if skipped_reply:
                 skipped.add(skipped_reply)
             switched_product = self._merge_facets(known_facets, facets)
             page_context = payload.get('page_context')
-            if chat and asks_edi_status(text):
+            if chat and (asks_edi_status(text) or demo_account.license_lookup(text, dialog) or demo_account.contract_lookup(text)):
                 return None
             if chat and basket_request(catalogue_text(text), page_context, facets):
                 return None
             has_viewed_sku = bool((dialog or {}).get('viewed_offer')) and not switched_product and not page_context
             if chat and not has_viewed_sku and power_bi_purchase_topics(catalogue_text(text), facets, page_context):
                 return None
+            if chat and (facets.get("article") or facets.get("articles")) and VIEWED_DETAILS.search(text):
+                return None
             offers = self._conversation_offers(db, state, text, facets, 6)
             local_offers = offers
             if chat and dialog:
                 viewed = None if switched_product else self._viewed_offer(db, state, dialog, known_facets)
                 if viewed and VIEWED_DETAILS.search(text):
-                    local_offers = [viewed] if self._viewed_term_matches(viewed, text, known_facets) else []
+                    local_offers = [viewed] if self._offer_term_matches(viewed, text, known_facets) else []
                 elif not offers and not (facets.get('product') or facets.get('article')):
                     local_offers = self._conversation_offers(db, state, text, known_facets, 6)
             else:
@@ -567,17 +729,28 @@ class Store:
                 return {"buyer_id": buyer_id}
             if action == "search":
                 limit = int(amount(payload.get("limit", 12), 1, 100))
+                grouped = payload.get("by_product") is True
+                page = payload.get("page", 1)
+                if type(page) is not int or not 1 <= page <= 100000:
+                    raise ValueError("Проверьте номер страницы")
+                offset = (page - 1) * limit
                 query = string(payload, "query", optional=True)
                 cleaned = catalogue_text(query).strip()
-                if query.strip() and not cleaned:
-                    return {"offers": []}
                 facets = facets_for(cleaned)
                 exact_family = facets.get("product") and named_products(cleaned.casefold())
-                if exact_family or facets.get("article"):
-                    if len(facets.get("products", ())) > 1:
-                        return {"offers": []}
-                    return {"offers": self._compatible_offers(db, state, facets.get("product"), facets, limit=limit)}
-                return {"offers": self._search(db, state, cleaned, limit)}
+                if query.strip() and not cleaned:
+                    offers = []
+                elif exact_family or facets.get("article"):
+                    offers = ([] if len(facets.get("products", ())) > 1 else
+                              self._compatible_offers(db, state, facets.get("product"), facets,
+                                                      limit=None if grouped else limit))
+                    if grouped:
+                        offers = (offers[offset:offset + limit + 1] if facets.get("article") else
+                                  self._catalog_cards(db, state, offers, limit + 1, offset))
+                else:
+                    offers = self._search(db, state, cleaned, limit + (1 if grouped else 0), by_product=grouped,
+                                          offset=offset if grouped else 0)
+                return {"offers": offers[:limit], "page": page, "has_more": len(offers) > limit} if grouped else {"offers": offers}
             if action == "order_status":
                 order = state["orders"][string(payload, "order_id").upper()]
                 self._own(state, order)
@@ -596,7 +769,11 @@ class Store:
                 if dialog["assignment"] != role:
                     raise PermissionError("Диалог назначен другому менеджеру")
                 if action == "reply":
+                    if self.business_hours and not self.business_hours():
+                        raise ValueError("Рабочие часы менеджера с 09:00 до 19:00 МСК.")
                     self._post_message(db, scope, dialog, role, payload)
+                    sales_chat.remember_reply(state, dialog)
+                    dialog.pop("price_field", None)
                 else:
                     dialog["status"] = "resolved"
                 return {"dialog": dialog}
@@ -611,7 +788,7 @@ class Store:
                 replay = reviews.replay(
                     state, role, string(payload, "dialog_id"), string(payload, "message_id"),
                     string(payload, "version"),
-                    lambda scenario, dialog, text: self._answer(db, scenario, dialog, text),
+                    lambda scenario, dialog, question: self._replay_answer(db, scenario, dialog, question),
                 )
                 return {"replay": replay}
             if action == "copilot":
@@ -646,7 +823,8 @@ class Store:
             offers = self._search(db, state, "MDaemon", 30) or self._search(db, state, limit=30)
             priced = next((item for item in offers if item["available"]), None)
             if priced:
-                state["changes"].append(dict(id=priced["id"], before=priced["price"],
+                state["changes"].append(dict(id=priced["id"], article=priced.get("vendor_code") or priced["id"],
+                                             currency=priced["currency"], before=priced["price"],
                                              price=float(amount(Decimal(str(priced["price"])) * Decimal("1.05")))))
         return {"feed": self._feed(db, state)}
 
@@ -669,12 +847,12 @@ class Store:
     def _message(dialog, role, text, **extra):
         dialog["messages"].append(dict(id=identifier("M"), role=role, text=text, at=now(), **extra))
 
-    def _post_message(self, db, scope, dialog, role, payload):
+    def _post_message(self, db, scope, dialog, role, payload, reference=None):
         if dialog["status"] == "resolved":
             raise ValueError("Чат завершён")
         file = payload.get("attachment")
         text = string(payload, "text", optional=bool(file), limit=4000)
-        extras = {}
+        extras = {"reference": reference} if reference else {}
         reply_to = string(payload, "reply_to", optional=True)
         if reply_to:
             original = next((m for m in dialog["messages"] if m["id"] == reply_to), None)
@@ -710,6 +888,8 @@ class Store:
 
     def _assign(self, state, role, action, payload):
         dialog = self._dialog(state, payload)
+        if self.business_hours and not self.business_hours():
+            raise ValueError("Рабочие часы менеджера с 09:00 до 19:00 МСК.")
         if action == "claim":
             if role not in MANAGERS or dialog["status"] != "queued":
                 raise PermissionError("Обращение недоступно для назначения")
@@ -734,10 +914,18 @@ class Store:
                 for key, manager in state["managers"].items()}
 
     def _route(self, state, dialog, reason, expertise, *, notification=None):
-        if dialog["assignment"] and dialog["status"] == "assigned":
-            return
         managers = self._managers(state)
         hour = (datetime.now(timezone.utc).hour + 3) % 24
+        if self.business_hours and not self.business_hours():
+            dialog.update(assignment=None, status="queued", offer_email=True,
+                          route=dict(reason=reason, expertise=expertise, candidates=managers))
+            self._message(dialog, "assistant", "Менеджеры отвечают с 09:00 до 19:00 МСК. Можно отправить запрос на почту.")
+            if "цен" in reason.casefold() and expertise == "лицензии":
+                question, choices = sales_chat.price_prompt(dialog, starting=True)
+                self._message(dialog, "assistant", question, choices=choices, mode="rules")
+            return
+        if dialog["assignment"] and dialog["status"] == "assigned":
+            return
         eligible = [
             (key, manager) for key, manager in managers.items() if manager["available"]
             and (key != "manager2" or reason == "Бронирование по запросу покупателя" and expertise in manager["expertise"])
@@ -750,6 +938,10 @@ class Store:
                       route=dict(reason=reason, expertise=expertise, candidates=managers))
         self._message(dialog, "assistant", (notification or "Передал обращение менеджеру.") if assignment
                       else "Обращение в очереди. Менеджер увидит его, когда будет доступен.")
+
+        if "цен" in reason.casefold() and expertise == "лицензии":
+            question, choices = sales_chat.price_prompt(dialog, starting=True)
+            self._message(dialog, "assistant", question, choices=choices, mode="rules")
 
     def _availability(self, state, role, payload):
         available = payload.get("available")
@@ -782,6 +974,43 @@ class Store:
         return bool(offer.get("available") and offer.get("old_price") and
                     0 < offer["price"] < offer["old_price"])
 
+    def _message_reference(self, db, state, reference):
+        kind, ref_id = reference["type"], reference["id"].strip()
+        if kind == "offer":
+            row = db.execute("SELECT body FROM offers WHERE id=?", (ref_id,)).fetchone()
+            record = self._offer(row[0], state) if row else None
+        elif kind == "group":
+            row = next(self._group_rows(db, ref_id), None)
+            record = self._catalog_cards(db, state, [self._offer(row[0], state)], 1)[0] if row else None
+        elif is_guest(state):
+            raise PermissionError("Войдите в личный кабинет.")
+        elif kind == "license":
+            record = next((row for row in demo_account.licenses(customer_id(state)) if row["id"] == ref_id), None)
+        else:
+            record = state["orders" if kind == "order" else "documents"].get(ref_id)
+            if record:
+                self._own(state, record)
+        if record is None:
+            raise KeyError("Запись недоступна")
+        name = record.get("group_name") or record.get("name") or ref_id
+        if kind == "order":
+            name = f"Заказ {ref_id} · {name}"
+        elif kind == "document":
+            document_type = "Счёт" if record["kind"] == "invoice" else "КП"
+            name = f"{document_type} {record.get('number') or ref_id}"
+        return {"type": kind, "id": ref_id, "label": name}, record
+
+    def _answer_account_reference(self, dialog, kind, record):
+        if kind == "order":
+            answer = ". ".join(filter(None, (record.get("status"), record.get("license_status")))) + "."
+        elif kind == "document":
+            answer = f"Сумма документа {record['total']:g} {record['currency']}. Скачать его можно в разделе «Счета и платежи»."
+        else:
+            status = "Срок лицензии истёк." if record["status"] == "expired" else "Лицензия действует."
+            answer = status + " Сведения о лицензии доступны в разделе «Дистрибутивы и ключи»."
+        self._message(dialog, "assistant", answer, mode="rules")
+        self._decision(dialog, kind, "inform", evidence=[record["id"]])
+
     def _buyer_chat(self, db, state, action, payload, model, scope):
         dialog = self._dialog(state, payload, create=True)
         self._own(state, dialog)
@@ -790,10 +1019,28 @@ class Store:
         if model and model["buyer_id"] != dialog["buyer_id"]:
             raise ValueError("Покупатель изменился. Повторите запрос.")
         text = ""
+        reference, record = None, None
         if action == "message" or payload.get("text"):
-            text = self._post_message(db, scope, dialog, "buyer", payload)
+            if payload.get("reference"):
+                reference, record = self._message_reference(db, state, payload["reference"])
+                payload = {key: value for key, value in payload.items()
+                           if key not in ("page_context", "viewed_offer_id", "viewed_group_id")}
+                if reference["type"] in ("offer", "group"):
+                    payload[f"viewed_{reference['type']}_id"] = reference["id"]
+            text = self._post_message(db, scope, dialog, "buyer", payload, reference)
             if payload.get("page_context"):
                 dialog["messages"][-1]["page_context"] = payload["page_context"]
+            group_id = payload.get("viewed_group_id")
+            # A tile visible behind the chat is only a hint for a question about it.
+            group_question = VIEWED_DETAILS.search(text) or text.startswith("Помогите подобрать лицензию для «")
+            if group_id and (reference or payload.get("starter") or group_question) and (group_id != dialog.get("viewed_group") or text == "Подобрать лицензию"):
+                dialog.update(viewed_group=group_id, group_request={})
+                dialog.pop("viewed_offer", None)
+                dialog.pop("optional_answers", None)
+                dialog["facets"] = {}
+            elif payload.get("viewed_offer_id"):
+                dialog.pop("viewed_group", None)
+                dialog.pop("group_request", None)
         if action == "handoff":
             self._route(state, dialog, "Запрос покупателя", "лицензии")
             self._decision(dialog, "operator", "handoff", mandatory=True)
@@ -804,10 +1051,9 @@ class Store:
                 if not row:
                     raise ValueError("Товар больше не доступен")
                 offer = self._offer(row[0], state)
-                dialog["facets"] = facets_for(offer["name"])
+                dialog["facets"] = viewed_facets(offer)
                 dialog["viewed_offer"] = offer["id"]
-                answer = (offer.get("description") or offer["name"]) + "\n\nЧто хотите уточнить о покупке?"
-                self._message(dialog, "assistant", answer, offers=[offer], mode="rules")
+                self._message(dialog, "assistant", "Что хотите уточнить по лицензии?", offers=[offer], mode="rules")
                 self._decision(dialog, "selection", "inform", evidence=[offer["id"]])
             elif starter in {"search", "choose"}:
                 dialog["guided_selection"] = starter == "choose"
@@ -818,45 +1064,47 @@ class Store:
                 self._decision(dialog, "selection", "clarify", missing=["product" if starter == "search" else "task"])
             else:
                 raise ValueError("Неизвестный стартовый вопрос")
+        elif dialog.get("offer_email") and text.casefold().strip() == "отправить на почту":
+            dialog["offer_email"] = False
+            dialog.pop("price_field", None)
+            self._message(dialog, "assistant", "Отправлено на почту.", mode="rules")
+            self._decision(dialog, "operator", "await_manager")
+        elif dialog.get("price_field") and text and not reference:
+            question, choices = sales_chat.price_prompt(dialog)
+            self._message(dialog, "assistant", question, choices=choices, mode="rules")
+            self._decision(dialog, "catalog", "await_manager")
         elif dialog["status"] not in {"assigned", "queued"}:
             if text:
                 viewed_id = payload.get("viewed_offer_id")
-                if viewed_id and VIEWED_DETAILS.search(text):
+                if viewed_id and (reference or VIEWED_DETAILS.search(text)):
                     incoming, _ = self._incoming_facets(text, dialog)
                     if not any(incoming.get(key) for key in ("product", "article", "articles")):
                         row = db.execute("SELECT body FROM offers WHERE id=?", (viewed_id,)).fetchone()
                         if row:
                             offer = self._offer(row[0], state)
                             if viewed_id != dialog.get("viewed_offer"):
-                                dialog["facets"] = facets_for(offer["name"])
+                                dialog["facets"] = viewed_facets(offer)
                                 dialog.pop("optional_answers", None)
                             dialog["viewed_offer"] = viewed_id
                         else:
                             dialog.pop("viewed_offer", None)
-                self._answer(db, state, dialog, text, model, payload.get("page_context"))
+                dialog["messages"][-1]["review_context"] = reviews.capture_context(dialog)
+                self._answer(db, state, dialog, text, model, payload.get("page_context"),
+                             (reference["type"], record) if reference else None)
             else:
                 self._message(dialog, "assistant", "Файл добавлен. Напишите, чем помочь.")
                 self._decision(dialog, "attachment", "clarify")
         else:
             self._decision(dialog, "follow_up", "await_manager")
         follow_up_field = None
-        if model:
+        if model and dialog["messages"][-1].get("role") == "assistant":
+            candidate = dialog["messages"][-1]
+            candidate["review_variants"] = dict(scenario=reviews.redact(candidate["text"]),
+                                                 draft=reviews.redact(str(model.get("generator_text") or model.get("text") or "")[:6000]))
             dialog["messages"][-1]["model"] = self._model_metadata(model)
             follow_up_field = self._publish_consultation(dialog, model)
         last = dialog["messages"][-1]
         if last.get("role") == "assistant":
-            clarifying = "?" in last["text"] or dialog.get("decision", {}).get("next_action") == "clarify"
-            if clarifying and any(m["role"] == "assistant" and m["text"].split("\nПо каталогу цена снижена:")[0] == last["text"]
-                                           for m in dialog["messages"][:-1]):
-                if follow_up_field:
-                    follow_up_field = None
-                    last["model"]["published"] = False
-                    last["mode"] = "rules"
-                if last.get("offers"):
-                    last["text"] = "Подходящие позиции есть в подборке ниже. Можно открыть карточку или перейти к расчёту."
-                else:
-                    last["text"] = "Можно продолжить без этого уточнения. Введите название программы или артикул из каталога."
-                    self._decision(dialog, "selection", "refine_search")
             if follow_up_field:
                 last["decision"]["missing"] = [follow_up_field]
             reduced = [offer for offer in last.get("offers", [])[:4] if self._reduced_price(offer)]
@@ -869,24 +1117,32 @@ class Store:
     def _publish_consultation(dialog, model):
         message = dialog["messages"][-1]
         decision = message.get("decision", {})
+        variants = message.setdefault("review_variants", {})
         if (not model.get("verified_model") or model.get("route") == "operator" or not message.get("offers")
                 or decision.get("next_action") != "shortlist"):
+            variants["reason"] = ("Модель недоступна." if not model.get("verified_model") else
+                "Выбран маршрут к менеджеру." if model.get("route") == "operator" else
+                "Модельное уточнение применяется при показе подборки.")
             return
         try:
             question = json.loads(model.get("text", ""))["question"]
         except (ValueError, TypeError, KeyError):
+            variants["reason"] = "В ответе модели отсутствует вопрос нужного формата."
             return
         choice = next((key for key, value in FOLLOW_UP_TEXT.items() if value == question), None)
         if not choice or not follow_up_missing(choice, dialog.get('facets', {}), dialog.get('optional_answers', {})):
+            variants["reason"] = 'Вопрос не входит в допустимые уточнения или ответ уже известен.'
             return
         grounded_id = model["grounded_id"]
         candidates = [offer for offer in message["offers"] if offer["available"]
                       and (offer["id"] == grounded_id if grounded_id else offer["id"] in model["candidate_ids"])]
         if not candidates:
+            variants["reason"] = "У модели нет подходящей доступной позиции."
             return
         offer = candidates[0]
         seats = decision.get("facets", {}).get("seats")
         if seats and not re.search(rf"\b{seats}\b", offer["name"]):
+            variants["reason"] = "Карточка не подтверждает нужное количество мест."
             return
         qualification = "\n" + message["text"] if decision.get("intent") == "security" or message.get("template_id") else ""
         code = offer.get("vendor_code")
@@ -913,14 +1169,75 @@ class Store:
         dialog["decision"] = decision
         dialog["messages"][-1]["decision"] = decision
 
-    def _answer(self, db, state, dialog, text, model=None, page_context=None):
+    def _replay_answer(self, db, state, dialog, question):
+        reference = question.get("reference")
+        resolved = None
+        if reference:
+            _, record = self._message_reference(db, state, reference)
+            resolved = (reference["type"], record)
+        self._answer(db, state, dialog, question["text"], page_context=question.get("page_context"), reference=resolved)
+
+    def _answer(self, db, state, dialog, text, model=None, page_context=None, reference=None):
+        previous = dialog.get("decision", {})
+        missing = previous.get("missing", [])
+        # Older conversations stored a task prompt as refine_search without a field.
+        legacy_task = previous.get("next_action") == "refine_search" and not missing and any(
+            m.get("role") == "assistant" and m.get("text", "").endswith("Опишите, для чего нужна программа.")
+            for m in dialog["messages"][-2:])
+        if not reference and ("task" in missing or legacy_task):
+            dialog["guided_selection"] = True
+            for key in ("viewed_group", "group_request", "viewed_offer"):
+                dialog.pop(key, None)
+            facets = dialog.setdefault("facets", {})
+            if legacy_task or previous.get("next_action") == "refine_search":
+                for key in ("product", "products", "article", "articles", "topic"):
+                    facets.pop(key, None)
+            facets["task"] = text
+        self._answer_request(db, state, dialog, text, model, page_context, reference)
+        decision = dialog.get("decision", {})
+        if (decision.get("next_action") == "clarify" and previous.get("next_action") == "clarify"
+                and decision.get("intent") in {"selection", "unclear", "security"}
+                and missing and missing == decision.get("missing") and "minimum_criterion" not in missing
+                and previous.get("intent") == decision["intent"] and previous.get("facets") == decision["facets"]):
+            # Preserve the unresolved field and its choices so the next reply still has a referent.
+            reply = dialog["messages"][-1]
+            choices = reply.setdefault("choices", [])
+            if dialog.get("guided_selection") and missing in (["seats"], ["platform"]):
+                choices.append("Пока не знаю")
+            if "Позвать менеджера" not in choices:
+                choices.append("Позвать менеджера")
+            if dialog.get("clarification_stalled") == missing:
+                dialog["messages"].pop()
+                self._route(state, dialog, "Не удалось уточнить запрос покупателя", "лицензии")
+                self._decision(dialog, decision["intent"], "handoff", mandatory=True)
+            else:
+                dialog["clarification_stalled"] = list(missing)
+        else:
+            dialog.pop("clarification_stalled", None)
+
+    def _answer_request(self, db, state, dialog, text, model=None, page_context=None, reference=None):
         folded = text.casefold()
         percent = re.search(r"(\d+(?:[.,]\d+)?)\s*%", folded)
         direct = re.search(r"(?:позов|позва|позви|подключ|соедин|переключ|переда|хочу|нужен|можно|дайте|зовите).{0,40}"
                            r"(?:человек|оператор|менеджер|специалист)", folded)
+        if re.search(r"\b(?:нов(?:ый|ое|ая)\s+(?:софт|по|программ)|подобрать\s+(?:софт|программу))", folded) and not re.search(r"цен|стои", folded):
+            dialog["guided_selection"] = True
+            self._message(dialog, "assistant", "Какую задачу вы хотите решить с помощью программы?", mode="rules")
+            return self._decision(dialog, "selection", "clarify", missing=["task"])
         if direct or re.fullmatch(r"\s*(?:оператор[ау]?|менеджер[ау]?|человек[ау]?)[.!?\s]*", folded):
             self._route(state, dialog, "Запрос покупателя", "лицензии")
             return self._decision(dialog, "operator", "handoff", mandatory=True)
+        if reference and reference[0] in ("order", "document", "license"):
+            return self._answer_account_reference(dialog, *reference)
+        pending = dialog.pop("discount_counteroffer", None)
+        if pending:
+            reply = folded.strip(" .!?")
+            if re.fullmatch(r"(нет|не подходит|не устраивает|отказываюсь|хочу больше)([, ].*)?", reply):
+                self._route(state, dialog, "Покупателю не подходит скидка 5%", "скидка")
+                return self._decision(dialog, "discount", "handoff", mandatory=True)
+            if reply in {"да", "подходит", "согласен", "согласна", "да, подходит", "устраивает"}:
+                folded = "скидка 5%"
+                percent = re.search(r"(5)%", folded)
         facets = dialog.setdefault("facets", {})
         incoming, skipped_reply = self._incoming_facets(text, dialog)
         if page_context == OFFICE_BUSINESS_PAGE and not (incoming.get("product") or incoming.get("article")):
@@ -933,17 +1250,34 @@ class Store:
         if re.search(r"\b(?:бронь|забронировать|бронирование|резервирование)\b", folded):
             self._route(state, dialog, "Бронирование по запросу покупателя", "заказы")
             return self._decision(dialog, "reservation", "handoff", mandatory=True)
+        if (dialog.get("viewed_offer") and not page_context
+                and not any(incoming.get(k) for k in ("products", "product", "article", "articles"))
+                and self._viewed_minimum(db, state, dialog, folded)):
+            return
         intent = classify(text)
         if not intent and dialog.get("decision", {}).get("intent") == "request_status":
             number = re.fullmatch(r"\s*(?:[a-zа-я]+[-_]\d+|\d{3,})\s*[.!]?\s*", folded)
             if number:
                 facets["request_number"] = number[0].strip(" .!").upper()
                 intent = "request_status"
+        if demo_account.license_lookup(text, dialog):
+            if is_guest(state):
+                return self._login_prompt(dialog)
+            answer, action, source = demo_account.license_answer(state, text)
+            if action == "handoff":
+                self._route(state, dialog, "Проверить покупку и выдачу ключа", "лицензии", notification=answer)
+                if dialog["status"] == "queued":
+                    dialog["messages"][-1]["text"] = answer + " Обращение в очереди."
+                dialog["messages"][-1]["synthetic"] = True
+            else:
+                self._message(dialog, "assistant", answer, mode="rules", source=source, synthetic=action == "lookup")
+            return self._decision(dialog, "license_lookup", action, evidence=[source] if source else [],
+                                  mandatory=action == "handoff")
         facts = answers_from_knowledge(text)
         edi_requested = asks_edi_status(text)
         if is_guest(state) and personal_request(text) and not edi_requested:
             return self._login_prompt(dialog)
-        if edi_requested or (page_context == OFFICE_BUSINESS_PAGE and VIEWED_DETAILS.search(text) and not intent):
+        if edi_requested or demo_account.contract_lookup(text) or (page_context == OFFICE_BUSINESS_PAGE and VIEWED_DETAILS.search(text) and not intent):
             evidence = []
             if VIEWED_DETAILS.search(text):
                 offers = self._conversation_offers(db, state, text, facets, 2)
@@ -956,11 +1290,11 @@ class Store:
                                   source=offer.get("url") or self._feed(db, state)["source"], mode="rules")
                     evidence.append(offer["id"])
                 else:
-                    self._message(dialog, "assistant", "Для какой редакции или артикула нужна цена?", mode="rules")
-            if edi_requested:
+                    self._message(dialog, "assistant", "Какую программу нужно подобрать и для какой задачи?", mode="rules")
+            if edi_requested or demo_account.contract_lookup(text):
                 for answer, source, _ in answers_from_knowledge(re.sub(r"\bэдо\b", "", text, flags=re.I)):
                     self._message(dialog, "assistant", answer, source=source, mode="rules")
-                return self._edi_status(state, dialog, text, evidence)
+                return self._company_profile(state, dialog, text, evidence)
             return self._decision(dialog, "selection", "inform" if evidence else "clarify",
                                   evidence=evidence, missing=[] if evidence else ["article"])
         basket = basket_request(catalogue_text(text), page_context, incoming)
@@ -981,13 +1315,47 @@ class Store:
                 answer = f"Заказ {order['id']}: {order['status']}. {order['license_status']}."
                 self._message(dialog, "assistant", answer, source=order["source"], mode="rules")
                 return self._decision(dialog, "post_purchase", "lookup", evidence=[order["id"]])
+        hesitant = re.search(r"слишком дорого|дороговато|сомневаюсь.{0,25}(цен|покуп)|дорого.{0,20}подумаю", folded)
+        if hesitant and "скид" not in folded:
+            self._message(dialog, "assistant", "Проверить, доступна ли скидка до 5%?", choices=["Проверить скидку"], mode="rules")
+            return self._decision(dialog, "discount", "clarify")
         if "скид" in folded:
-            if percent and float(percent[1].replace(",", ".")) > 5:
-                self._route(state, dialog, "Скидка выше 5%", "скидка")
-                return self._decision(dialog, "discount", "handoff", mandatory=True)
+            if re.search(r"не (?:нужна|хочу|надо).{0,12}скид|без скид|скидк\w* не (?:нужна|надо)", folded):
+                dialog.pop("approved_discount", None)
+                self._message(dialog, "assistant", "Оставляю цену каталога без дополнительной скидки.")
+                return self._decision(dialog, "discount", "inform")
             recent = next((m["offers"] for m in reversed(dialog["messages"]) if m.get("offers")), [])
+            if percent and float(percent[1].replace(",", ".")) > 5:
+                discount_part = re.search(r"(?:дадите ли |можно ли |дадите |можно )?скидк[^?.!]*", text, re.I)
+                if facets.get("product") and re.search(r"цен|стои", folded):
+                    self._selection(db, state, dialog, text)
+                    if discount_part and discount_part.start():
+                        dialog["messages"][-1]["review_fragment"] = text[:discount_part.start()].rstrip(" ,и?")
+                    price_message = dialog["messages"][-1]
+                    recent = price_message.get("offers", [])
+                    if len(recent) == 1 and recent[0]["available"] and recent[0]["price"] > 0:
+                        offer = recent[0]
+                        price_message["text"] = f"{offer['name']}: {offer['price']:g} {offer['currency']}."
+                        price_message.pop("template_id", None)
+                    elif len(recent) > 1:
+                        price_message["text"] = "Какую редакцию выбрать для расчёта цены?"
+                        price_message.pop("template_id", None)
+                    if dialog.get("decision", {}).get("next_action") == "handoff":
+                        return
+                if len(recent) == 1 and self._reduced_price(recent[0]):
+                    self._message(dialog, "assistant", "На эту позицию уже действует скидка. Скидки не суммируются.")
+                    return self._decision(dialog, "discount", "inform")
+                dialog["discount_counteroffer"] = True
+                self._message(dialog, "assistant", "Могу предложить 5% для позиции без действующей скидки. Вам подходит?",
+                              choices=["Да, подходит", "Не подходит"], mode="rules")
+                if discount_part:
+                    dialog["messages"][-1]["review_fragment"] = discount_part[0]
+                return self._decision(dialog, "discount", "clarify", missing=["discount_acceptance"])
             if len(recent) == 1 and recent[0]["available"]:
                 offer = recent[0]
+                if self._reduced_price(offer) or re.search(r"купон|акци|корпоративн.{0,15}цен", folded):
+                    self._message(dialog, "assistant", "Скидки не суммируются. Для этой позиции сохраняется действующая цена.")
+                    return self._decision(dialog, "discount", "inform")
                 rate = float(percent[1].replace(",", ".")) if percent else 5
                 dialog["approved_discount"] = dict(offer_id=offer["id"], rate=rate)
                 self._message(dialog, "assistant", f"Для позиции «{offer['name']}» согласована скидка {rate:g}%. Учту её при оформлении.", offers=[offer])
@@ -1017,21 +1385,31 @@ class Store:
                           "Откройте «Мои заказы» в личном кабинете и выберите покупку. Статус, документы и доступные лицензии указаны в карточке заказа.",
                           source=KNOWLEDGE, mode="rules")
             return self._decision(dialog, "post_purchase", "inform", evidence=[KNOWLEDGE])
-        if any(term in folded for term in ("вне каталог", "нет в каталог", "нет на сайт", "запросить цен", "цена по запросу")):
+        if dialog.get("viewed_group") and not page_context and self._answer_product_group(db, state, dialog, text, incoming):
+            return
+        if any(term in folded for term in ("вне каталог", "нет в каталог", "нет на сайт", "запросить цен", "запрос цены", "запрашиваю цену", "нужна цена", "цена по запросу")):
             self._route(state, dialog, "Нужна проверка товара или цены", "лицензии")
             return self._decision(dialog, "catalog", "handoff", mandatory=True)
+        learned = state.get("support_answers", {}).get(sales_chat.support_topic(text))
+        if learned:
+            self._message(dialog, "assistant", learned["text"], source="Ответ службы поддержки", mode="rules")
+            return self._decision(dialog, "knowledge", "inform")
         if VIEWED_DETAILS.search(text):
+            if incoming.get("articles"):
+                self._message(dialog, "assistant", "Вы указали несколько артикулов. Какую позицию проверить первой?", mode="rules")
+                return self._decision(dialog, "selection", "clarify", missing=["article"])
+            if incoming.get("article"):
+                return self._answer_article(db, state, dialog, text, facets)
             offer = self._viewed_offer(db, state, dialog, facets)
             if offer:
                 source = self._feed(db, state)["source"]
-                if not self._viewed_term_matches(offer, text, facets):
-                    self._message(dialog, "assistant", "Укажите артикул лицензии на нужный срок, чтобы проверить цену.",
+                if not self._offer_term_matches(offer, text, facets):
+                    self._message(dialog, "assistant", "На какой срок нужна лицензия? Менеджер проверит цену подходящего варианта.",
                                   source=source, mode="rules")
                     return self._decision(dialog, "selection", "clarify", missing=["article"])
-                answer = (offer.get("description") or offer["name"]) + (
-                    f"\nЦена: {offer['price']:g} {offer['currency']}." if offer["available"] else "\nЦена по запросу.")
-                self._message(dialog, "assistant", answer, offers=[offer], source=source, mode="rules")
-                return self._decision(dialog, "selection", "inform", evidence=[offer["id"]])
+                return self._answer_viewed_offer(db, state, dialog, offer, text)
+        if reference and reference[0] == "offer" and dialog.get("viewed_offer") == reference[1]["id"]:
+            return self._answer_viewed_offer(db, state, dialog, reference[1], text)
         # Consequential routes require explicit language confirmed above. The
         # model may refine a non-binding follow-up for purchase-related context.
         if model and model.get("decision_version") and not model.get("needs_clarification", True):
@@ -1043,6 +1421,43 @@ class Store:
                               source=KNOWLEDGE, mode="rules")
                 return self._decision(dialog, "post_purchase", "clarify", missing=["order_question"])
         return self._selection(db, state, dialog, text)
+
+    def _answer_viewed_offer(self, db, state, dialog, offer, text=""):
+        source = self._feed(db, state)["source"]
+        answer = ""
+        asks_price = re.search(r"\b(?:цен[ауые]|сколько сто|стоимост)", text, re.I)
+        if asks_price:
+            answer = (f"Цена: {offer['price']:g} {offer['currency']}."
+                      if offer["available"] else "Цена по запросу.")
+        elif re.search(r"\b(?:наличи\w*|доступн\w*|доступен|в наличии)", text, re.I):
+            answer = ("Товар доступен к заказу." if offer["available"] else
+                      "Менеджер уточнит, можно ли заказать товар.")
+        self._message(dialog, "assistant", answer, offers=[offer], source=source, mode="rules",
+                      show_offer_details=not asks_price)
+        if not offer["available"]:
+            reason = "Подтверждение поставки" if offer["price"] > 0 else "Уточнение цены"
+            self._route(state, dialog, reason, "лицензии")
+            return self._decision(dialog, "catalog", "handoff", evidence=[offer["id"]], mandatory=True)
+        return self._decision(dialog, "selection", "inform", evidence=[offer["id"]])
+
+    def _answer_article(self, db, state, dialog, text, facets):
+        offers = self._compatible_offers(db, state, facets.get("product"), facets, limit=2)
+        source = self._feed(db, state)["source"]
+        if len(offers) != 1 or not self._offer_term_matches(offers[0], text, facets):
+            prompt = ("По артикулу найдено несколько позиций. Пришлите код нужной позиции из карточки."
+                      if len(offers) > 1 else "По артикулу нет совпадения с вашими условиями. Проверьте код в карточке товара.")
+            self._message(dialog, "assistant", prompt, source=source, mode="rules")
+            return self._decision(dialog, "selection", "clarify", missing=["article"])
+        offer = offers[0]
+        if not offer["available"]:
+            self._message(dialog, "assistant", f"{offer['name']}. Цена по запросу.", offers=[offer], source=source, mode="rules")
+            self._route(state, dialog, "Проверка цены и возможности покупки по артикулу", "лицензии")
+            return self._decision(dialog, "catalog", "handoff", evidence=[offer["id"]], mandatory=True)
+        answer = f"{offer['name']}.\nЦена: {offer['price']:g} {offer['currency']}."
+        if re.search(AVAILABILITY_DETAILS, text, re.I):
+            answer += " По данным каталога, позиция доступна для оформления."
+        self._message(dialog, "assistant", answer, offers=[offer], source=source, mode="rules")
+        return self._decision(dialog, "selection", "inform", evidence=[offer["id"]])
 
     @staticmethod
     def _incoming_facets(text, dialog):
@@ -1095,29 +1510,35 @@ class Store:
         self._message(dialog, "assistant", "Войдите в личный кабинет, чтобы продолжить с данными вашей покупки.", mode="rules")
         return self._decision(dialog, "account", "login")
 
-    def _edi_status(self, state, dialog, text, evidence):
+    def _company_profile(self, state, dialog, text, evidence):
         if is_guest(state):
             return self._login_prompt(dialog)
-        if customer_id(state) == "personal":
-            self._message(dialog, "assistant", "Вы вошли как частный клиент. Проверить ЭДО можно в профиле компании.", mode="rules")
-            return self._decision(dialog, "edi", "inform")
         buyer = customer_id(state)
-        company = PROFILES.get(buyer)
-        # Status belongs to the active mock profile. Free text cannot select another account.
-        remaining = text.casefold()
-        if company:
-            normalize = lambda value: value.casefold().replace("«", '"').replace("»", '"')
-            remaining = normalize(text).replace(normalize(company), "")
-        scoped = company and not re.search(
-            r"\b(?:ооо|пао|ао|ип|инн)\b|\bдруг\w*\s+(?:компани|организац)|(?:компани|организаци)\w*\s+[«\"]", remaining)
-        status = state.get("edi_by_buyer", {"buyer1": True, "buyer2": False}).get(buyer)
-        if scoped and isinstance(status, bool):
-            result = "подключён" if status else "не подключён"
-            self._message(dialog, "assistant", f"У {company} ЭДО {result}.", source="Профиль покупателя", mode="rules")
-            return self._decision(dialog, "edi", "lookup", evidence=[*evidence, "buyer_profile"])
-        self._route(state, dialog, "Проверить подключение ЭДО организации", "заказы",
-                    notification="Менеджер проверит подключение ЭДО вашей организации.")
-        return self._decision(dialog, "edi", "handoff", evidence=evidence, mandatory=True)
+        if buyer not in demo_account.CONTRACTS:
+            self._message(dialog, "assistant", "Для проверки организации войдите в профиль компании.", mode="rules")
+            return self._decision(dialog, "account", "inform")
+        parts, missing = [], []
+        if demo_account.contract_lookup(text):
+            active = state.get("contract_by_buyer", demo_account.CONTRACTS).get(buyer)
+            if isinstance(active, bool):
+                parts.append("У вашей организации есть действующий договор." if active else "У вашей организации нет действующего договора.")
+            else:
+                missing.append("договор")
+        if asks_edi_status(text):
+            status = state.get("edi_by_buyer", {"buyer1": True, "buyer2": False}).get(buyer)
+            if isinstance(status, bool):
+                parts.append("У вашей организации ЭДО подключён." if status else "У вашей организации ЭДО не подключён.")
+            else:
+                missing.append("подключение ЭДО")
+        if parts:
+            self._message(dialog, "assistant", " ".join(parts), mode="rules", synthetic=True)
+            evidence.append("buyer_profile")
+        if missing:
+            subject = " и ".join(missing)
+            self._route(state, dialog, "Проверить " + subject, "заказы",
+                        notification=f"Менеджер проверит {subject} вашей организации.")
+        return self._decision(dialog, "company_profile", "handoff" if missing else "lookup",
+                              evidence=evidence, mandatory=bool(missing))
 
     def _answer_basket(self, db, state, dialog, context, request, facts):
         evidence = []
@@ -1152,6 +1573,7 @@ class Store:
             items = [line for line in items if line["offer_id"] == selected]
 
         priced, known, unknown, unavailable, out_of_bounds = [], [], [], [], []
+        confirm_delivery = []
         for item in items:
             sku, quantity = item["offer_id"], item["quantity"]
             stored = db.execute("SELECT body FROM offers WHERE id=?", (sku,)).fetchone()
@@ -1163,9 +1585,11 @@ class Store:
             minimum, maximum = offer.get("min_quantity", 1), offer.get("max_quantity", 100000)
             if not minimum <= quantity <= maximum:
                 out_of_bounds.append(f"{offer['name']}: от {minimum} до {maximum} шт.")
-            elif not offer["available"]:
+            elif offer["price"] <= 0:
                 unavailable.append(offer["name"])
             else:
+                if not offer["available"]:
+                    confirm_delivery.append(offer["name"])
                 priced.append(self._document_line(offer, quantity))
         missing = []
         if unknown:
@@ -1185,7 +1609,7 @@ class Store:
             for action in documents:
                 doc = self._save_document(state, action, priced)
                 title = "Готов учебный счёт" if action == "invoice" else "Готово учебное КП"
-                self._message(dialog, "assistant", f"{title} {doc['id']}. Его можно скачать в разделе «Документы».",
+                self._message(dialog, "assistant", f"{title} {doc['id']}. Его можно скачать в разделе «Счета и платежи».",
                               document_id=doc["id"], mode="rules")
         if priced and (request["price"] or documents and not can_create):
             lines = [f"{line['name']}, {line['quantity']} шт. Стоимость {line['total']:.2f} {line['currency']}." for line in priced]
@@ -1198,7 +1622,9 @@ class Store:
         if missing:
             return self._decision(dialog, "basket", "clarify", missing=missing, evidence=evidence)
         mixed_currency_document = documents and len(currencies) > 1
-        if request["tax"] or unavailable or mixed_currency_document:
+        if confirm_delivery:
+            self._message(dialog, "assistant", "Менеджер подтвердит поставку: " + ", ".join(confirm_delivery) + ".")
+        if request["tax"] or unavailable or mixed_currency_document or confirm_delivery:
             reason = "Проверка НДС по позициям корзины" if request["tax"] else "Проверка условий для позиций корзины"
             self._route(state, dialog, reason, "заказы")
             return self._decision(dialog, "basket", "handoff", evidence=evidence, mandatory=True)
@@ -1212,7 +1638,7 @@ class Store:
         refines_vendor = old_product in {"kaspersky", "криптопро"} and new_product.startswith(old_product + " ")
         switched = bool(old_product and new_product and new_product != old_product and not (same_mdaemon or refines_vendor))
         if switched:
-            for name in ("products", "versions", "edition", "oem", "delivery", "article", "seats", "seat_range",
+            for name in ("products", "versions", "edition", "oem", "delivery", "article", "articles", "seats", "seat_range",
                          "quantity", "cores", "duration", "billing_period", "license_term", "license_operation",
                          "accessory", "device_type", "platforms", "architecture", "deployment", "topic", "targets",
                          "infrastructure", "purpose", "budget", "budget_limit", "value_preference"):
@@ -1221,6 +1647,10 @@ class Store:
             previous.pop("seats", None)
         elif "seats" in current:
             previous.pop("seat_range", None)
+        if "articles" in current:
+            previous.pop("article", None)
+        elif "article" in current:
+            previous.pop("articles", None)
         previous.update(current)
         return switched
 
@@ -1290,7 +1720,7 @@ class Store:
         facets = dialog.setdefault("facets", {})
         security = facets.get("topic") == "security" or any(term in folded for term in ("защит", "антивирус"))
         platform_reply = any(re.fullmatch(pattern, folded.strip()) for pattern in PLATFORMS.values()) and bool(facets.get("platforms"))
-        query = facets.get("product") if platform_reply else self._query(text) or facets.get("product")
+        query = facets.get("product") if platform_reply or facets.get("article") else self._query(text) or facets.get("product")
         security = security and (not query or "kaspersky" in query.casefold() or facets.get("topic") == "security")
         if facets.get("topic") == "office_suite" and (not query or "office" not in query.casefold()):
             self._message(dialog, "assistant",
@@ -1373,12 +1803,10 @@ class Store:
             if dialog.get("guided_selection"):
                 if not facets.get("task"):
                     facets["task"] = text
-                if not facets.get("seats") and not dialog.get("asked_seats"):
-                    dialog["asked_seats"] = True
+                if not facets.get("seats") and not dialog.get("optional_answers", {}).get("seats"):
                     self._message(dialog, "assistant", "Сколько человек будут пользоваться программой?", mode="rules")
                     return self._decision(dialog, "selection", "clarify", missing=["seats"])
-                if not dialog.get("asked_platform"):
-                    dialog["asked_platform"] = True
+                if not facets.get("platforms") and not dialog.get("optional_answers", {}).get("platform"):
                     self._message(dialog, "assistant", "На каких устройствах будет работать программа?", mode="rules")
                     return self._decision(dialog, "selection", "clarify", missing=["platform"])
                 subject = facets.get("task", "") + " " + text
@@ -1392,6 +1820,9 @@ class Store:
                     return self._decision(dialog, "selection", "shortlist", evidence=[o["id"] for o in options])
                 self._message(dialog, "assistant", "Для какой работы нужна программа: защита компьютеров, документы, почта или другая задача?", mode="rules")
                 return self._decision(dialog, "selection", "clarify", missing=["category"])
+            if not any(facets.values()) and not re.search(r"купить|подбор|подобрать|лицензи|программ|товар", folded):
+                self._message(dialog, "assistant", "Можете уточнить, с каким вопросом вы обратились?", mode="rules")
+                return self._decision(dialog, "unclear", "clarify", missing=["intent"])
             self._message(dialog, "assistant", "Укажите название продукта и на сколько пользователей или устройств нужна лицензия.",
                           mode="rules")
             return self._decision(dialog, "selection", "clarify", missing=["product", "seats"])
@@ -1401,12 +1832,12 @@ class Store:
         offers = self._compatible_offers(db, state, query, facets)
         if not offers and query and query.casefold() == "криптопро csp" and facets.get("platforms"):
             self._message(dialog, "assistant",
-                          "В каталоге не нашёл карточку CSP с подтверждённой совместимостью. Укажите версию или артикул для проверки.",
+                          "В каталоге не нашёл карточку CSP с подтверждённой совместимостью. Менеджер поможет проверить совместимость с вашей системой.",
                           mode="rules")
             return self._decision(dialog, "selection", "clarify", missing=["compatible_article"])
         if not offers and query and query.casefold().startswith("kaspersky") and facets.get("device_type") == "desktop":
             missing = ["endpoint_article"]
-            prompt = "В каталоге не нашёл подтверждённый вариант для этих компьютеров. Уточните редакцию или артикул."
+            prompt = "В каталоге нет подтверждённого варианта для этих компьютеров. Какую задачу должна решать программа?"
             if not facets.get("platforms"):
                 missing.append("platforms")
                 prompt += " Какие операционные системы установлены на ПК?"
@@ -1414,9 +1845,9 @@ class Store:
             return self._decision(dialog, "security", "clarify", missing=missing)
         if not offers and facets.get("buyer_type") in {"budget", "education", "self_employed"}:
             prompts = {
-                "budget": "Какие условия закупки действуют у вашей организации? Если редакция уже согласована, пришлите её артикул.",
-                "education": "Укажите точную редакцию или артикул, чтобы проверить условия поставки для образовательной организации.",
-                "self_employed": "Укажите редакцию или артикул. Нужно проверить, доступна ли поставка самозанятому.",
+                "budget": "Какие условия закупки действуют у вашей организации? Для какой задачи подбираете программу?",
+                "education": "Сколько лицензий нужно образовательной организации?",
+                "self_employed": "Для какой работы нужна программа? Менеджер проверит условия покупки для самозанятого.",
             }
             self._message(dialog, "assistant",
                           prompts[facets["buyer_type"]],
@@ -1430,7 +1861,7 @@ class Store:
                           offers=offers, mode="rules")
             return self._decision(dialog, "selection", "shortlist", evidence=[item["id"] for item in offers])
         detail = ("Уточните редакцию и срок лицензии. Срок обновлений зависит от конкретной позиции."
-                  if "mdaemon" in query.casefold() else "Уточните редакцию, число устройств и срок лицензии.")
+                  if "mdaemon" in (query or "").casefold() else "Уточните редакцию, число устройств и срок лицензии.")
         if quantity:
             detail = f"Подборка для указанного количества мест: {quantity}. Выберите позицию, чтобы посмотреть условия."
         if security:
@@ -1453,6 +1884,41 @@ class Store:
         query = self._query(text)
         return self._compatible_offers(db, state, query, {**facets, "product": query}, limit) if query else []
 
+    def _viewed_minimum(self, db, state, dialog, text):
+        pending = "minimum_criterion" in dialog.get("decision", {}).get("missing", [])
+        asks_minimum = re.fullmatch(r"[\w\s,]*(?:минимальн\w*|базов\w*)\s+(?:верси\w*|редакци\w*|вариант\w*)[?!.\s]*", text)
+        refers_back = re.fullmatch(r"\s*(?:(?:тут|здесь)\s+)?(?:только\s+)?один\s+(?:товар|продукт)|(?:он|она|товар)\s+в\s+начале\s+(?:переписки|чата)", text.strip(" .!?"))
+        quantity = pending and re.fullmatch(r"(?:по\s+)?(?:количеств\w*|числ\w*)(?:\s+(?:ящик\w*|лицензи\w*|мест))?[.!?\s]*", text)
+        features = pending and re.fullmatch(r"(?:по\s+)?(?:функци\w*|возможност\w*|редакци\w*)[.!?\s]*", text)
+        if not (asks_minimum or refers_back or quantity or features):
+            return False
+        row = db.execute("SELECT body FROM offers WHERE id=?", (dialog["viewed_offer"],)).fetchone()
+        if not row:
+            return False
+        offer = self._offer(row[0], state)
+        facets = dialog["facets"]
+        if facets.get("articles") or (facets.get("article") and str(facets["article"]).casefold() not in
+                                     {offer["id"].casefold(), (offer.get("vendor_code") or "").casefold()}):
+            return False
+        # Older chats can still contain multiple families inferred from one catalogue title.
+        if facets.get("products") and facets["products"] != facets_for(offer["name"]).get("products"):
+            return False
+        if features:
+            self._route(state, dialog, "Сравнение возможностей редакций: " + offer["name"], "лицензии")
+            self._decision(dialog, "selection", "handoff", evidence=[offer["id"]], mandatory=True)
+            return True
+        low, high = offer.get("min_quantity"), offer.get("max_quantity")
+        detail = f"По этой позиции заказ от {low} до {high} шт." if low and high else (
+            f"По этой позиции заказ от {low} шт." if low else "В карточке минимальное количество не указано.")
+        clarify = bool(asks_minimum or (refers_back and pending))
+        question = " Вы имеете в виду количество для заказа или набор функций?" if asks_minimum else ""
+        lead = "Да, речь об одной позиции: " if refers_back else ""
+        self._message(dialog, "assistant", f"{lead}«{offer['name']}». {detail}{question}",
+                      source=offer.get("url") or self._feed(db, state)["source"], mode="rules")
+        self._decision(dialog, "selection", "clarify" if clarify else "inform",
+                       missing=["minimum_criterion"] if clarify else [], evidence=[offer["id"]])
+        return True
+
     def _viewed_offer(self, db, state, dialog, facets):
         offer_id = dialog.get("viewed_offer")
         if not offer_id or len(facets.get("products", ())) > 1:
@@ -1467,7 +1933,7 @@ class Store:
         return offer if self._matches_constraints(offer, facets) else None
 
     @staticmethod
-    def _viewed_term_matches(offer, text, facets):
+    def _offer_term_matches(offer, text, facets):
         requested = license_months(text) or license_months(facets.get("duration", ""))
         if not requested:
             return True
@@ -1487,7 +1953,7 @@ class Store:
                 facets = {**facets, "product": "криптопро csp"}
             elif family == "kaspersky" and facets.get("device_type") == "desktop":
                 facets = {**facets, "product": "kaspersky endpoint security"}
-            rows = db.execute("SELECT body FROM offers WHERE id=? OR lower(json_extract(body,'$.vendor_code'))=?",
+            rows = db.execute("SELECT body FROM offers WHERE id=? COLLATE NOCASE OR lower(json_extract(body,'$.vendor_code'))=?",
                               (article, article))
             offers = [self._offer(row[0], state) for row in rows]
         else:
@@ -1504,7 +1970,7 @@ class Store:
                 if suffix:
                     for offer in self._search(db, state, " ".join([alternative, *suffix]), 64):
                         offers.setdefault(offer["id"], offer)
-                for offer in self._search(db, state, alternative, max(limit, 220)):
+                for offer in self._search(db, state, alternative, max(limit, 220) if limit is not None else -1):
                     offers.setdefault(offer["id"], offer)
             offers = offers.values()
         return [offer for offer in offers if self._matches_constraints(offer, facets)][:limit]
@@ -1669,7 +2135,9 @@ class Store:
         offer = self._offer(row[0], state)
         dialog = self._dialog(state, payload, create=True)
         self._own(state, dialog)
-        self._message(dialog, "buyer", f"Запрос цены на «{offer['name']}», код в каталоге {offer_id}.")
+        if dialog["status"] == "resolved":
+            raise ValueError("Чат завершён")
+        self._message(dialog, "buyer", f"Запрос цены на «{offer['name']}», код в каталоге {offer_id}.", price_card=True)
         dialog.setdefault("facets", {})["offer_id"] = offer_id
         self._route(state, dialog, "Подтверждение цены выбранной позиции", "лицензии")
         self._decision(dialog, "catalog", "handoff", mandatory=True, evidence=[offer_id])
@@ -1709,7 +2177,7 @@ class Store:
             self._own(state, dialog)
             approved = dialog.get("approved_discount", {})
         discount = amount(approved["rate"], 0, 5) if approved.get("offer_id")==offer_id else Decimal(0)
-        if not offer["available"]:
+        if offer["price"] <= 0:
             dialog = self._dialog(state, payload, create=True)
             self._own(state, dialog)
             reason = "Нужно подтвердить наличие и цену"
@@ -1723,6 +2191,12 @@ class Store:
         if "expected_price" in payload and amount(payload["expected_price"]) != price:
             raise ValueError("Цена изменилась. Снова выберите позицию в каталоге")
         doc = self._save_document(state, action, [self._document_line(offer, quantity, discount)])
+        if not offer["available"]:
+            dialog = self._dialog(state, payload, create=True)
+            self._own(state, dialog)
+            self._message(dialog, "assistant", f"Документ {doc['id']} готов. Поставку подтвердит менеджер.", document_id=doc["id"])
+            self._route(state, dialog, "Подтверждение поставки " + offer["name"], "заказы")
+            return {"dialog": dialog, "document": self._document_view(doc)}
         if payload.get("dialog_id"):
             dialog = self._dialog(state, payload)
             self._own(state, dialog)
@@ -1763,6 +2237,8 @@ class Store:
             for key in ("payment", "delivery_type", "delivery", "license_term", "validity"):
                 if any(line[key] != first[key] for line in lines):
                     doc[key] = UNKNOWN
+        if action == "proposal":
+            doc["validity"] = "30 дней с даты выставления"
         templates = [t for t in state["templates"].values() if t["status"] == "published"
                      and t["kind"] == ("invoice" if action == "invoice" else "quote")]
         if templates:

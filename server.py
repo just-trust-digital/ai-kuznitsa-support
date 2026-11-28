@@ -4,6 +4,7 @@ import hmac
 import json
 import mimetypes
 import os
+import socket
 import secrets
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +54,12 @@ def credential_group(directory, filename, roles):
 
 class SupportServer(ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 def buyer_view(result):
@@ -63,6 +70,7 @@ def buyer_view(result):
                 offer["price"] = None
 
     public_offers(result.get("offers", ()))
+    public_offers(result.get("catalog", ()))
     dialogs = list(result.get("dialogs", ()))
     if "dialog" in result:
         dialogs.append(result["dialog"])
@@ -93,6 +101,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; object-src 'none'; base-uri 'none'")
@@ -232,7 +241,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--runtime", type=Path, default=ROOT / "private" / "runtime")
-    parser.add_argument("--access-dir", type=Path, default=ROOT / "private" / "runtime",
+    parser.add_argument("--access-dir", type=Path, default=os.environ.get("SUPPORT_ACCESS_DIR") or ROOT / "private" / "runtime",
                         help="Directory for stable access tokens, shared by local previews by default.")
     parser.add_argument("--materials", type=Path, default=ROOT / "private" / "support-agent")
     parser.add_argument("--init-access", action="store_true")

@@ -7,9 +7,9 @@ from urllib.parse import urlsplit
 
 UNKNOWN = "Требует уточнения"
 PROFILES = {
-    "personal": "Марина Орлова",
-    "buyer1": "ООО «Северный контур»",
-    "buyer2": "ООО «Вектор систем»",
+    "personal": "Марина Тестова",
+    "buyer1": "ООО «Примерная компания»",
+    "buyer2": "ИП «Иванов»",
 }
 
 TEMPLATES = [

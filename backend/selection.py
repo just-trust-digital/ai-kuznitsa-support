@@ -42,6 +42,8 @@ PRODUCT_PATTERNS = (
 )
 EDITION = r"\b(standard|datacenter|business|professional|enterprise|pro|стандартн\w*)\b"
 ARCHITECTURE = r"\b(x86[-_]64|x64|arm64|aarch64|arm|эльбрус(?:[-\s]?[\w]+)?)\b"
+ARTICLE = re.compile(r"\b(?:артикул(?:ами|а|у|ом|е|ы|ов)?|sku|код[ \t]+позиции)\b"
+                     r"(?:[ \t]*[:№#][ \t]*|[ \t]+)([a-z0-9][a-z0-9._-]{1,126}[a-z0-9_])(?![\w-])", re.I)
 NUMBER_WORDS = dict(один=1, одна=1, две=2, два=2, три=3, четыре=4,
                     пять=5, шесть=6, семь=7, восемь=8, девять=9, десять=10)
 COUNT = r"(\d{1,5}|" + "|".join(NUMBER_WORDS) + r")"
@@ -88,6 +90,9 @@ def license_months(text):
 
 def facets_for(text):
     text = catalogue_text(text)
+    articles = list(dict.fromkeys(match[1].casefold() for match in ARTICLE.finditer(text)))
+    if articles:
+        text = ARTICLE.sub(" ", text)
     folded = text.casefold().replace("ё", "е")
     facets = {}
     seats = re.search(QUANTITY + COUNT_MODIFIERS
@@ -171,9 +176,10 @@ def facets_for(text):
                            r"([a-zа-я]+[-_]\d+|\d{3,})\b", folded)
     if identifier:
         facets["request_number"] = identifier[1].upper()
-    article = re.search(r"\b(?:артикул|sku)\s*[:№#]?\s*([a-z0-9][a-z0-9._-]{2,})\b", folded)
-    if article:
-        facets["article"] = article[1]
+    if len(articles) == 1:
+        facets["article"] = articles[0]
+    elif articles:
+        facets["articles"] = articles
     product, versions = product_for(text)
     platforms = [platform for platform, pattern in PLATFORMS.items()
                  if re.search(rf"\b(?:для|под|на)\s+(?:ос\s+)?(?:{pattern})\b", folded)]

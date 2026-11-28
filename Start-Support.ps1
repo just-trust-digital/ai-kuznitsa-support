@@ -1,11 +1,13 @@
 param(
     [ValidateRange(1, 65535)][int]$Port = 8766,
     [ValidateSet('buyer', 'personal', 'manager1', 'manager2', 'jury', 'developer')][string]$CopyToken,
+    [switch]$ListKeys,
     [switch]$ConfigureTelegram
 )
 $ErrorActionPreference = 'Stop'
 $entry = Join-Path $PSScriptRoot 'server.py'
 $runtimeDir = Join-Path $PSScriptRoot 'private/runtime'
+$accessDir = if ($env:SUPPORT_ACCESS_DIR) { $env:SUPPORT_ACCESS_DIR } else { $runtimeDir }
 $telegramFile = Join-Path $runtimeDir 'telegram-token.dpapi'
 if ($ConfigureTelegram) {
     $Host.UI.RawUI.WindowTitle = 'Softline | Telegram @jtd_test_bot'
@@ -25,11 +27,18 @@ if ($ConfigureTelegram) {
     }
     return
 }
-if ($CopyToken) {
-    & python $entry --init-access
+if ($CopyToken -or $ListKeys) {
+    & python $entry --access-dir $accessDir --init-access
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($ListKeys) {
+        foreach ($name in 'access.json', 'personal-access.json') {
+            $keys = Get-Content -LiteralPath (Join-Path $accessDir $name) -Raw | ConvertFrom-Json
+            $keys.PSObject.Properties | Select-Object @{Name='Role';Expression={$_.Name}}, @{Name='Key';Expression={$_.Value}}
+        }
+        return
+    }
     $filename = if ($CopyToken -eq 'personal') { 'personal-access.json' } else { 'access.json' }
-    $access = Get-Content -LiteralPath (Join-Path $runtimeDir $filename) -Raw | ConvertFrom-Json
+    $access = Get-Content -LiteralPath (Join-Path $accessDir $filename) -Raw | ConvertFrom-Json
     Set-Clipboard -Value $access.$CopyToken
     Write-Output "Token copied for $CopyToken"
     return

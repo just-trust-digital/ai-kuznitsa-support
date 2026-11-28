@@ -4,7 +4,8 @@ import re
 
 
 SKU = re.compile(r"[A-Za-z0-9_.-]{1,128}")
-PRICE = re.compile(r"\b(?:цен[ауые]|стоимост\w*|сколько\s+(?:это\s+)?стоит|сумм[ауе]|итого|рассчита\w*|посчита\w*)\b")
+PRICE = re.compile(r"\b(?:цен[ауые]|стоимост\w*|сколько\s+(?:(?:это|теперь|сейчас)\s+)*стоит|"
+                   r"сумм[ауе]|итого|рассчита\w*|посчита\w*)\b")
 TAX = re.compile(r"\bндс\b")
 TAX_PRICE = re.compile(r"цен[ауые]\s+(?:уже\s+)?(?:с|без)\s+ндс|(?:включ\w*|входит)\s+ндс")
 DOCUMENT_VERB = r"(?:сделайте|подготовьте|оформите|сформируйте|выставьте|пришлите|дайте|нужен|нужно)"
@@ -36,7 +37,8 @@ def valid_basket(context):
 
 
 def basket_request(text, context, facets):
-    if not context or context.get("type") != "basket" or facets.get("product") or facets.get("article"):
+    if (not context or context.get("type") != "basket" or facets.get("product")
+            or facets.get("article") or facets.get("articles")):
         return None
     text = text.casefold().replace("ё", "е")
     documents = []

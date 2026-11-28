@@ -18,6 +18,7 @@ class Storage:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL,
                     category TEXT, body TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS offers_product_group ON offers(json_extract(body,'$.group_id'));
                 CREATE TABLE IF NOT EXISTS catalog(
                     key TEXT PRIMARY KEY, value TEXT NOT NULL
                 );

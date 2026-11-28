@@ -26,9 +26,10 @@ class KnowledgeParts(unittest.TestCase):
                 answer = " ".join(m["text"] for m in dialog["messages"] if m["role"] == "assistant")
                 self.assertIn("12 345", answer)
                 self.assertIn(status, answer)
-            other = ask('Мы из ООО «Другая компания». Есть ли у нас ЭДО?')
-            self.assertEqual(other["decision"]["next_action"], "handoff")
-            self.assertNotIn("ЭДО не подключён", str(other["messages"]))
+            # Replay treats the named company as the active fictional profile.
+            named = ask('Мы из ООО «Другая компания». Есть ли у нас ЭДО?')
+            self.assertEqual(named["decision"]["next_action"], "lookup")
+            self.assertTrue(named["messages"][-1]["synthetic"])
             contextual = ask("Сколько стоит?", page_context=OFFICE_BUSINESS_PAGE)
             self.assertIn("12 345", contextual["messages"][-1]["text"])
 

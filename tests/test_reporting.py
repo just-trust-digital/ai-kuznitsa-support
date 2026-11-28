@@ -20,7 +20,8 @@ class TestSupportReporting(unittest.TestCase):
             say("Позовите человека", greeting)
             buying = say("Нужен MDaemon")
             say("Оператор", buying)
-            say("Можно скидку 9%?")
+            counteroffer = say("Можно скидку 9%?")
+            say("Не подходит", counteroffer)
             say("Здравствуйте")
             stats = stand.snapshot("manager1", "jury-check")["handoff_stats"]
             self.assertEqual((stats["dialogs"], stats["first_request"], stats["later_request"], stats["automatic"]),

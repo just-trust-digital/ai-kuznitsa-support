@@ -150,7 +150,7 @@ class CoreTests(unittest.TestCase):
         self.act("developer", "template_publish", template_id=template["id"])
         quote = self.act("buyer", "proposal", offer_id="demo-mdaemon-20", quantity=2)["document"]
         download = self.act("buyer", "download", document_id=quote["id"])["content"]
-        for fragment in ("Коммерческое предложение", "Получатель", "срок действия КП", "способ оплаты",
+        for fragment in ("Коммерческое предложение", "Получатель", "30 дней с даты выставления", "способ оплаты",
                          "срок поставки", "Требует уточнения", "В т. ч. НДС", "38400.00",
                          f"Тест 2 0.0 {quote['id']} demo-mdaemon-20"):
             self.assertIn(fragment, download)
@@ -176,6 +176,7 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(next(offer for offer in offers if offer["id"] == "1")["available"])
         result = self.act("buyer", "invoice", offer_id="1")
         self.assertIn("dialog", result)
+        self.assertEqual(result["document"]["total"], 100)
         self.assertEqual(self.act("buyer", "feed_import", day=2)["feed"]["changes"][0]["id"], "2")
         with self.assertRaises(ValueError):
             self.act("buyer", "proposal", offer_id="2", expected_price=200)
@@ -186,8 +187,23 @@ class CoreTests(unittest.TestCase):
             self.store.import_catalog()
         self.assertEqual(self.store.snapshot("buyer", self.scope)["feed"]["count"], 2)
 
+    def test_unclear_request_and_discount_counteroffer(self):
+        unclear = self.act("buyer", "message", text="А как это?")["dialog"]
+        self.assertEqual(unclear["decision"]["missing"], ["intent"])
+        prompt = "Нужен MDaemon на 20 мест. Какая цена и дадите ли скидку 7%?"
+        dialog = self.act("buyer", "message", text=prompt)["dialog"]
+        self.assertEqual(dialog["decision"]["missing"], ["discount_acceptance"])
+        self.assertEqual(len(dialog["messages"]), 3)
+        self.assertNotIn("approved_discount", dialog)
+        accepted = self.act("buyer", "message", dialog_id=dialog["id"], text="Да, подходит")["dialog"]
+        self.assertIsNone(accepted["assignment"])
+        self.assertEqual(accepted["approved_discount"]["rate"], 5)
+
     def test_routing_review_and_template(self):
         first = self.act("buyer", "message", text="Просим скидку 7%")["dialog"]
+        self.assertIsNone(first["assignment"])
+        self.assertIn("5%", first["messages"][-1]["text"])
+        first = self.act("buyer", "message", dialog_id=first["id"], text="Не подходит")["dialog"]
         self.assertEqual(first["assignment"], "manager1")
         with self.assertRaises(PermissionError):
             self.act("manager2", "reply", dialog_id=first["id"], text="Ошибочно")
@@ -248,7 +264,8 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("draft", answer["model"])
         self.assertNotIn("Модель предлагает", answer["text"])
         handoff = self.act("buyer", "message", text="Скидка 12% на MDaemon")["dialog"]
-        self.assertEqual(handoff["assignment"], "manager1")
+        self.assertIsNone(handoff["assignment"])
+        self.assertIn("5%", handoff["messages"][-1]["text"])
         self.assertNotIn("draft", handoff["messages"][-1]["model"])
 
     def test_first_turn_clarifies_and_keeps_security_requirements(self):
@@ -623,6 +640,46 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(answer['mode'], 'rules')
         self.assertIn('19200', answer['text'])
         self.assertFalse(answer['model'].get('published'))
+
+    def test_price_and_availability_use_the_explicit_article(self):
+        calls = []
+
+        def transport(url, payload):
+            calls.append(url)
+            raise AssertionError('exact article should go through the local catalogue')
+
+        feed = self.directory / 'article.xml'
+        feed.write_text('''<yml_catalog><shop><offers>
+          <offer id="Item-One" available="true"><name>MDaemon Standard на 1 год</name><price>13000</price><vendorCode>MD-ONE</vendorCode></offer>
+          <offer id="item-other" available="false"><name>MDaemon Professional на 1 год</name><price>14000</price><vendorCode>MD-DUP</vendorCode></offer>
+          <offer id="item-dup" available="true"><name>MDaemon Outlook Connector на 1 год</name><price>15000</price><vendorCode>MD-DUP</vendorCode></offer>
+        </offers></shop></yml_catalog>''', encoding='utf-8')
+        self.store = Store(self.directory / 'article.db', feed, engine=IntegrationEngine(
+            'http://127.0.0.1:11439', 'http://127.0.0.1:11434', 'qwen3:8b', transport, llm_api='ollama',
+        ))
+
+        for article in ('item-one', 'MD-ONE'):
+            with self.subTest(article=article):
+                answer = self.act('buyer', 'message', mode='local',
+                                  text=f'Сколько стоит и есть ли в наличии артикул {article} на 1 год?')['dialog']
+                self.assertEqual(answer['decision']['next_action'], 'inform')
+                self.assertEqual(answer['decision']['evidence'], ['Item-One'])
+                self.assertIn('Цена: 13000 RUB.', answer['messages'][-1]['text'])
+                self.assertIn('доступна для оформления', answer['messages'][-1]['text'])
+
+        for text in ('Сколько стоит артикул MD-ONE на 2 года?', 'Сколько стоит артикул MD-DUP?',
+                     'Сколько стоит артикул md-unknown?', 'Сколько стоит Dr.Web с артикулом MD-ONE?',
+                     'Сколько стоят артикул MD-ONE и артикул item-other?'):
+            with self.subTest(text=text):
+                answer = self.act('buyer', 'message', mode='local', text=text)['dialog']
+                self.assertEqual(answer['decision']['missing'], ['article'])
+                self.assertNotIn('Цена:', answer['messages'][-1]['text'])
+
+        unavailable = self.act('buyer', 'message', mode='local', text='Сколько стоит артикул item-other?')['dialog']
+        self.assertEqual(unavailable['decision']['next_action'], 'handoff')
+        self.assertEqual(unavailable['decision']['evidence'], ['item-other'])
+        self.assertNotIn('14000', '\n'.join(message['text'] for message in unavailable['messages']))
+        self.assertEqual(calls, [])
 
     def test_configured_adapters_publish_only_grounded_consultations(self):
         captured = []

@@ -14,8 +14,7 @@ const safeUrl = value => {
 let token = sessionStorage.getItem('softline-token') ?? '';
 let session, role, state, dialogId, result, tab, busy = false, samplePage = 0, sampleQuery = '', selectedOffer = '';
 let errorText = '';
-let standExpanded = false;
-let catalogExpanded = false;
+let catalogSearch;
 const clientContexts = new Map();
 const sample = (offers, count) => {
   const pool = [...offers];
@@ -28,10 +27,9 @@ function clientContext() {
     const offers = list(state.offers);
     const priced = offers.filter(offer => offer.available);
     clientContexts.set(key, {
-      viewed: sample(offers.slice(0,8),1)[0],
-      licenses: role==='buyer' ? sample(priced,2+Math.floor(Math.random()*2)) : [],
+      viewed: undefined,
       cart: new Map((role==='buyer' ? sample(priced,1+Math.floor(Math.random()*2)) : [])
-        .map(offer => [String(offer.id),offer])),
+        .map(offer => [String(offer.id),{offer,quantity:quantityOf(offer)}])),
     });
   }
   return clientContexts.get(key);
@@ -48,20 +46,31 @@ function guestToken() {
   return value;
 }
 let chatOpen = false, launcherSeen = false, training = false, buyerDraft = '';
-const openProducts = new Set();
-let chatPane='', quoteDraft, fileDraft, staffDraft='', audioContext;
+let chatPane='', quoteDraft, fileDraft, referenceDraft, staffDraft='', audioContext;
 let soundMuted=localStorage.getItem('softline-chat-muted')==='true';
-const clearComposer=()=>{ buyerDraft=staffDraft=''; quoteDraft=fileDraft=undefined; };
+const clearComposer=()=>{ buyerDraft=staffDraft=''; quoteDraft=fileDraft=referenceDraft=undefined; };
 const chatIcons={
   close:'<path d="m6 6 12 12M18 6 6 18"/>',
   more:'<path d="M12 5h.01M12 12h.01M12 19h.01" stroke-width="3.5"/>',
   reply:'<path d="M9 5 3 11l6 6v-4h4c4 0 6 2 8 5 0-7-3-9-8-9H9Z"/>',
   attach:'<path d="m8 13 6-6a3 3 0 0 1 4 4l-8 8a5 5 0 0 1-7-7l9-9m-5 9a1 1 0 0 0 2 2l7-7"/>',
   emoji:'<circle cx="12" cy="12" r="9"/><path d="M8 14c2 3 6 3 8 0M9 9h.01M15 9h.01"/>',
+  question:'<path d="M20 11a8 8 0 0 1-8 8H4l2-4a8 8 0 1 1 14-4Z"/><path d="M10 9a2 2 0 1 1 3 1.7c-.7.5-1 1-1 1.8m0 2.5h.01"/>',
+  cart:'<path d="M2 4h3l2 11h11l3-8H6"/><circle cx="9" cy="19" r="1"/><circle cx="17" cy="19" r="1"/>',
+  catalog:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+  payments:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18m-14 5h4"/>',
+  keys:'<circle cx="15.5" cy="8.5" r="4.5"/><path d="m12 12-7 7H3v-3l7-6m7-2h.01"/>',
+  copy:'<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2"/>',
+  download:'<path d="M12 3v12m-4-4 4 4 4-4M4 16v4h16v-4"/>',
+  external:'<path d="M13 4h7v7m0-7-9 9m7 0v6H4V6h7"/>',
+  refresh:'<path d="M20 10a8 8 0 1 0-1 7m1-13v6h-6"/>',
+  logout:'<path d="M11 4H4v16h7m3-12 4 4-4 4m-5-4h10"/>',
+  plus:'<path d="M12 5v14M5 12h14"/>',
+  minus:'<path d="M5 12h14"/>',
   send:'<path d="m3 10 18-7-7 18-3-8-8-3Zm8 3 10-10"/>'
 };
 const icon=name=>'<svg aria-hidden="true" viewBox="0 0 24 24">'+chatIcons[name]+'</svg>';
-const iconButton=(name,title,action,value='')=>'<button type="'+(action?'button':'submit')+'" class="chat-icon" aria-label="'+title+'" title="'+title+'" '+
+const iconButton=(name,title,action,value='',extra='')=>'<button type="'+(action?'button':'submit')+'" class="chat-icon '+extra+'" aria-label="'+attr(title)+'" title="'+attr(title)+'" '+
   (action?'data-do="'+action+'" data-value="'+attr(value)+'"':'')+
   (action==='chat-options'?' aria-controls="chat-options" aria-expanded="'+(chatPane==='options')+'"':'')+'>'+icon(name)+'</button>';
 const chatTime=new Intl.DateTimeFormat('ru-RU',{hour:'2-digit',minute:'2-digit',timeZone:'Europe/Moscow'});
@@ -79,10 +88,10 @@ function notifyMessage() {
 }
 const modes = [['rules','По сценарию'],['local','Локальная модель'],['hybrid','Модель и каталог']];
 function resetWorkspace() {
-  chatOpen = launcherSeen = standExpanded = catalogExpanded = training = false;
+  chatOpen = launcherSeen = training = false;
   clearComposer();
   chatPane=selectedOffer='';
-  openProducts.clear();
+  catalogSearch=undefined;
 }
 const requestIds = new WeakMap();
 const button = (text, action, value, extra='') => '<button type="button" data-do="'+action+'" data-value="'+attr(value)+'" '+extra+'>'+escape(text)+'</button>';
@@ -125,6 +134,11 @@ async function request(path, data) {
   return payload;
 }
 async function loadState() { state = await request('/api/state?role='+encodeURIComponent(role)); }
+async function loadCatalog(query, page) {
+  const data = await request('/api/action',{role,action:'search',payload:{query,by_product:true,page,limit:8}});
+  selectedOffer='';
+  catalogSearch={query,page:data.page ?? page,offers:list(data.offers),hasMore:data.has_more===true};
+}
 async function signIn(value) {
   token = value;
   session = await request('/api/me');
@@ -176,7 +190,8 @@ async function downloadChatFile(messageId) {
 function renderLogin() {
   nav.replaceChildren();
   resetWorkspace();
-  app.innerHTML = '<h1>Поддержка Softline</h1><section class="panel narrow"><h2>Вход</h2>'+statusMarkup()+form('login',
+  app.classList.remove('buyer-main','chat-visible');
+  app.innerHTML = standHeading('Поддержка Softline')+'<section class="panel narrow"><h2>Вход</h2>'+statusMarkup()+form('login',
     field('Токен доступа','token','','type="password" required autocomplete="off" autofocus')+
     '<div class="login-actions">'+submit('Войти')+button('Продолжить как гость','guest-start','')+'</div>')+'</section>';
   syncMobileChat();
@@ -185,21 +200,28 @@ function renderLogin() {
 function statusMarkup() {
   return '<p id="status" class="status" role="status" tabindex="-1">'+escape(errorText)+'</p>';
 }
+function standHeading(title) {
+  return '<div class="stand-heading"><h1>'+escape(title)+'</h1></div>';
+}
 function render() {
   if (!session) { renderLogin(); return; }
-  nav.innerHTML = (session.role==='jury' ? choices(list(session.roles).map(id=>[id,label(id)]),'role',role) : '')
-    +button('Обновить','refresh','')+(session.role==='guest'?button('Войти в кабинет','customer-login',''):button('Выйти','logout',''));
+  const visibleRoles=list(session.roles).filter(id=>id!=='manager2' || id===role || state?.manager2_active);
+  nav.innerHTML = (session.role==='jury' ? choices(visibleRoles.map(id=>[id,label(id)]),'role',role) : '')
+    +(!storefront() || session.role==='jury' ? iconButton('refresh','Обновить обращения','refresh') : '')
+    +(session.role==='guest'?button('Войти в кабинет','customer-login',''):iconButton('logout','Выйти','logout'));
   if (!state) { app.innerHTML='<h1>Рабочее место</h1>'+statusMarkup(); return; }
   const page = storefront() ? buyerPage() : staffPage();
-  app.innerHTML = '<h1>'+escape(page.title)+'</h1>'+statusMarkup()+page.html;
+  app.classList.toggle('buyer-main',storefront());
+  app.innerHTML = standHeading(page.title)+statusMarkup()+page.html;
   syncMobileChat();
   applyFieldHints();
 }
 const phoneScreen=matchMedia('(max-width:540px)');
 function syncMobileChat() {
   const widget=app.querySelector('.widget');
+  app.classList.toggle('chat-visible',Boolean(widget));
   const fullScreen=Boolean(widget && phoneScreen.matches);
-  for (const node of [document.querySelector('header'),document.querySelector('footer'),...app.children]) {
+  for (const node of [document.querySelector('header'),...app.children]) {
     if (node!==widget) node.inert=fullScreen;
   }
   if (widget) {
@@ -235,59 +257,100 @@ function conversation(dialog,staff=false) {
     const speaker = who==='buyer' && (role==='guest' || dialog.buyer_id?.startsWith('visitor-')) ? 'guest' : who;
     const id = m.id ?? m.message_id;
     const offers=list(m.offers).slice(0,4);
+    const legacyOffer=who==='assistant' && offers.length===1 && offers[0];
+    const legacyText=legacyOffer && [legacyOffer.description || legacyOffer.name, 'Что хотите уточнить о покупке?'].join('\n\n');
+    const text=legacyOffer && (m.text===legacyText || m.text==='Что хотите уточнить по лицензии?')?'':m.text;
     const quote=m.quote?'<blockquote><b>'+escape(label(m.quote.role))+'</b><div>'+escape(displayText(m.quote.text))+'</div></blockquote>':'';
     const file=m.attachment?button(m.attachment.name,'chat-file',id,'class="chat-file"'):'';
+    const reference=m.reference?'<div class="message-reference">'+icon('attach')+escape(displayText(m.reference.label))+'</div>':'';
     const reply=id && dialog.status!=='resolved' && !training && role!=='developer' && who!=='system'?iconButton('reply','Ответить на сообщение','quote',id):'';
     return '<article class="bubble '+(who === (staff?role:'buyer')?'mine':'')+'"><small>'+escape(label(speaker))+'</small>'+quote+
-      '<div class="message-text" data-message="'+attr(id)+'">'+escape(displayText(m.text))+'</div>'+file+offers.slice(0,1).map(o=>chatOffer(o,staff)).join('')+
+      reference+'<div class="message-text" data-message="'+attr(id)+'">'+escape(displayText(text))+'</div>'+file+
+      offers.slice(0,1).map(o=>chatOffer(o,staff,m.show_offer_details)).join('')+
       (offers.length>1?'<details><summary>Ещё варианты ('+(offers.length-1)+')</summary>'+offers.slice(1).map(o=>chatOffer(o,staff)).join('')+'</details>':'')+
       (safeUrl(m.source)?'<a href="'+attr(safeUrl(m.source))+'" target="_blank" rel="noreferrer">Источник</a>':'')+
       (staff && training && id && (who==='assistant'||who==='bot')?
         '<div class="row">'+button('+' ,'rate',id,'aria-label="Ответ полезен" data-rating="+"')+button('−','rate',id,'aria-label="Ответ не помог" data-rating="-"')+'</div>':'')+
+      (m.synthetic ? '<span class="mock-data-note">исп. синтетич. данные</span>' : '')+
       '<div class="message-meta">'+timeMarkup(m.at)+reply+'</div></article>';
   },'Сообщений пока нет.')+'</div>';
 }
 function offerPrice(offer, showComparison = true) {
-  if (!offer.available || offer.price == null) return 'Цена по запросу';
+  if (!(offer.price>0)) return 'Цена по запросу';
   const current=escape(num(offer.price))+' '+escape(offer.currency);
   return showComparison && Number(offer.old_price)>Number(offer.price) && Number(offer.price)>0
     ? '<span class="reduced-price">'+current+' <span>Цена снижена</span></span> <del>'+escape(num(offer.old_price))+' '+escape(offer.currency)+'</del>' : current;
 }
 function offerAction(o, action) {
-  if (role==='guest' && o.available) return button('Войти для оформления','customer-login','');
-  return o.available ? button('Счёт или КП',action,o.id,'data-available="true"') : button('Запросить цену','price-request',o.id);
+  if (o.group_recommendation && o.available) {
+    const added=clientContext().cart.has(String(o.id));
+    return button(added?'В корзине':'В корзину','chat-cart',o.id,added?'disabled':'');
+  }
+  if (role==='guest' && o.price>0) return button('Войти для оформления','customer-login','');
+  return o.price>0 ? button('Счёт или КП',action,o.id,'data-available="true"') : button('Запросить цену','price-request',o.id);
 }
-function chatOffer(o,staff) {
-  return item(displayText(o.name),'<p>'+offerPrice(o)+'</p>'+quantityTerms(o)+offerPreview(o)+(staff?'':offerAction(o,'chat-offer')));
+function chatOffer(o,staff,details) {
+  const price=details===false && !o.old_price?'':'<p>'+offerPrice(o)+'</p>';
+  return item(displayText(o.name).replace(/[,;]\s*$/,''),price+quantityTerms(o)+offerPreview(o,details)+(staff?'':offerAction(o,'chat-offer')));
 }
-function offerPreview(o) {
+function offerPreview(o,expanded) {
   const url=safeUrl(o.url);
-  const term=o.params?.['Срок действия']?.[0];
-  const delivery=o.params?.['Тип поставки']?.[0];
-  const details=[o.description,term && term!=='Не определено'?'Срок лицензии · '+term:'',delivery?'Поставка · '+delivery:''].filter(Boolean);
-  if (!details.length) details.push(o.available?'Доступно к заказу':'Цена и наличие по запросу');
-  return '<details class="offer-preview"><summary>Карточка товара</summary><div>'+
-    details.map(s=>'<p>'+escape(displayText(s))+'</p>').join('')+
-    (url?'<a href="'+attr(url)+'" target="_blank" rel="noreferrer">Открыть на сайте</a>':'')+'</div></details>';
+  const {fields,description}=offerDetails(o);
+  const facts=fields.length?'<dl>'+fields.map(([name,value])=>'<div><dt>'+escape(name)+'</dt><dd>'+escape(value)+'</dd></div>').join('')+'</dl>':'';
+  const link=url?'<a href="'+attr(url)+'" target="_blank" rel="noreferrer">Открыть на сайте</a>':'';
+  if (!description && fields.length<=1) return '<div class="offer-inline">'+facts+link+'</div>';
+  return '<details class="offer-preview"'+(expanded?' open':'')+'><summary>Характеристики</summary><div>'+facts+
+    (description?'<p>'+escape(description)+'</p>':'')+link+'</div></details>';
+}
+function quantityRange(o) {
+  const min=quantityOf(o), max=o.max_quantity;
+  if (min===max) return num(min)+' шт.';
+  return 'От '+num(min)+(max?' до '+num(max):'')+' шт.';
 }
 function quantityTerms(o) {
   const capacity=o.params?.['К-во пользователей до']?.find(v=>/^\d+$/.test(v));
-  const units=o.min_quantity===o.max_quantity && o.min_quantity ? 'Заказ: '+num(o.min_quantity)+' шт.' :
-    o.min_quantity ? 'Заказ от '+num(o.min_quantity)+(o.max_quantity?' до '+num(o.max_quantity):'')+' шт.' : '';
+  const units=o.min_quantity ? 'Заказ '+quantityRange(o).toLocaleLowerCase('ru-RU') : '';
   return [capacity?'До '+num(Number(capacity))+' пользователей':null,units].filter(Boolean).map(text=>'<p>'+text+'</p>').join('');
+}
+function offerDetails(offer) {
+  const labels=new Map([['Срок действия','Срок лицензии'],['Платформа','Платформа'],['Тип лицензии','Тип лицензии'],
+    ['Тип поставки','Поставка'],['Минимальная покупка','Минимальный заказ']]);
+  const values=new Map();
+  const description=[];
+  const useful=value=>value && !/^(не определено|другое или отсутствует)$/i.test(value);
+  for (const part of displayText(offer.description ?? '').split(/\s*•\s*|\n+/)) {
+    const line=part.trim();
+    if (!line || line===displayText(offer.name) || (offer.min_quantity && /^(минимальная покупка[\s:]|заказ от\s)/i.test(line))) continue;
+    const [,key,value]=line.match(/^([^:]+):\s*(.+)$/) ?? [];
+    if (labels.has(key)) { if (useful(value)) values.set(key,value); }
+    else description.push(line);
+  }
+  const fields=[];
+  for (const [key,label] of labels) {
+    const paramKey=key==='Платформа'?'Совместимая архитектура/платформа':key;
+    const params=list(offer.params?.[paramKey]).map(displayText).filter(useful);
+    const value=values.get(key) || [...new Set(params)].join(', ');
+    if (value && !(key==='Минимальная покупка' && offer.min_quantity)) fields.push([label,value]);
+  }
+  return {fields,description:[...new Set(description)].join(' ')};
 }
 function buyerPage() {
   const d = activeDialog();
   const current = tab ?? 'catalog';
-  const tabs = [['catalog','Каталог'],['cart','Корзина'],...(role==='buyer'?[['orders','Заказы'],['docs','Документы']]:[])];
-  const modules = {catalog:catalogPage,cart:cartPage,orders:ordersPage,docs:docsPage};
+  const tabs = [['catalog','Каталог'],['cart','Корзина'],...(role==='buyer'?[['payments','Счета и платежи'],['keys','Дистрибутивы и ключи']]:[])];
+  const modules = {catalog:catalogPage,cart:cartPage,payments:paymentsPage,keys:keysPage};
   const jury = session.role==='jury';
-  const settings = jury && role==='buyer' ? '<aside class="panel session"><h2>Сессия</h2><details id="jury-stand" '+(standExpanded?'open':'')+'><summary>Настроить сессию</summary><label>Как отвечает помощник'+choose('mode',modes,buyerMode)+'</label>'+standPage()+'</details></aside>' : '';
+  const settings = jury && role==='buyer' ? '<aside class="panel session" id="jury-stand"><h2>Настройки сессии</h2>'+
+    '<label>Профиль клиента'+choose('client_profile',Object.entries(state.client_profiles ?? {}),state.buyer_id)+'</label>'+
+    '<label>Модель ответа'+choose('mode',modes,buyerMode)+'</label>'+
+    button('Очистить историю','clear-history','')+'</aside>' : '';
   const owner=state.customer?.company_name || state.customer?.full_name;
-  const store = '<div class="shop">'+(owner?'<p>'+escape(owner)+'</p>':'')+'<h2 id="context-heading">Контекст переписки</h2>'+
-    '<nav class="context-tabs" aria-labelledby="context-heading">'+choices(tabs,'tab',current)+'</nav>'+modules[current]()+'</div>';
+  const store = '<div class="shop">'+(owner && !settings?'<p>'+escape(owner)+'</p>':'')+'<h2 id="context-heading">Контекст переписки</h2>'+
+    '<nav class="context-tabs" aria-labelledby="context-heading">'+tabs.map(([id,title])=>
+      '<button type="button" class="context-tab" data-do="tab" data-value="'+id+'" aria-pressed="'+(current===id)+'">'+icon(id)+escape(title)+'</button>').join('')+
+    '</nav>'+modules[current]()+'</div>';
   const launcher = '<button class="launcher '+(launcherSeen?'':'invite')+'" type="button" data-do="open-chat" aria-label="Открыть чат поддержки"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-8l-6 4v-4H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/><path d="M7 9h10M7 13h7"/></svg></button>';
-  return {title:'ИИ ассистент поддержки',html:'<div class="'+(settings?'grid':'')+'">'+settings+store+'</div>'+(chatOpen?buyerChat(d):launcher)};
+  return {title:'ИИ ассистент поддержки',html:'<div class="'+(settings?'buyer-layout':'')+'">'+settings+store+'</div>'+(chatOpen?buyerChat(d):launcher)};
 }
 function handoffLabel(d) {
   if (d?.status==='resolved') return 'Чат закрыт';
@@ -297,28 +360,49 @@ function handoffLabel(d) {
 }
 function buyerChat(d) {
   const viewedOffer = (tab ?? 'catalog')==='catalog' ? clientContext().viewed : undefined;
-  const greeting = viewedOffer ? 'Здравствуйте! Рассказать о товаре «'+viewedOffer.name+'»?' : 'Здравствуйте! Ищете конкретную программу или помочь с выбором?';
-  const starters = (viewedOffer?button('Расскажите о товаре','starter','viewed'):button('Ищу программу','starter','search'))+button('Помогите с выбором','starter','choose');
+  const greeting = viewedOffer?.group_name ? 'Здравствуйте! Помочь подобрать лицензию для «'+viewedOffer.group_name+'»?' :
+    viewedOffer ? 'Здравствуйте! Рассказать о товаре «'+viewedOffer.name+'»?' : 'Здравствуйте! Ищете конкретную программу или помочь с выбором?';
+  const questions={
+    offer:['Подробнее о товаре','Сколько стоит товар?'],
+    group:['Подобрать лицензию','Какие есть варианты?'],
+    cart:['Подробнее о товаре','Сколько стоит позиция?'],
+    order:['Какой статус заказа?','Ключ уже готов?'],
+    document:['Какая сумма документа?','Где скачать документ?'],
+    license:['Лицензия ещё действует?','Где посмотреть лицензию?']
+  };
+  const kind=referenceDraft?.kind ?? referenceDraft?.type ?? (viewedOffer && (viewedOffer.group_name?'group':'offer'));
+  const starters=kind?questions[kind].map(q=>button(q,'context-question',q)).join(''):
+    button('Ищу программу','starter','search')+button('Помогите с выбором','starter','choose');
   const menu='<div class="chat-options" id="chat-options" '+(chatPane==='options'?'':'hidden')+'>'+
     button('Новый чат','new-dialog','')+button(soundMuted?'Включить звук':'Выключить звук','sound','')+
     (d && d.status!=='resolved'?button('Завершить консультацию','end-chat',d.id):'')+button('Мои обращения','chat-history','')+'</div>';
   const history=chatPane==='history'?'<div class="chat-history"><div class="history-heading"><h3>Мои обращения</h3>'+button('К переписке','chat-thread','')+'</div>'+chatHistory()+'</div>':'';
-  const thread = d?conversation(d):'<p class="bubble">'+escape(displayText(greeting))+'</p>';
+  const thread = d?conversation(d):referenceDraft?'':'<p class="bubble">'+escape(displayText(greeting))+'</p>';
+  const last=d?.messages.at(-1);
+  let choices=list(last?.choices);
+  if (!choices.length && last?.offers?.some(o=>o.group_recommendation)) {
+    choices=last.offers.length>1?['Чем отличаются варианты?','Сколько стоят варианты?']:['Сколько стоит лицензия?'];
+  }
+  if (d?.offer_email) choices=[...choices,'Отправить на почту'];
   const status = handoffLabel(d);
-  return '<section class="widget" aria-label="Помощник Softline"><div class="widget-head"><img src="/softline-solutions.png" alt=""><h2>Помощник Softline</h2>'+
+  return '<section class="widget" aria-label="Помощник Softline"><div class="widget-head"><img src="/sofl.png" alt=""><h2>Помощник Softline</h2>'+
     iconButton('more','Опции чата','chat-options')+iconButton('close','Закрыть чат','close-chat')+'</div>'+menu+history+
     '<div class="thread" '+(history?'hidden':'')+'>'+thread+'</div><div class="chat-foot" '+(history?'hidden':'')+'><p class="chat-error" role="alert"></p>'+
     (status?'<p class="handoff" role="status">'+escape(status)+'</p>':'')+
     (role==='guest' && d?.decision?.next_action==='login'?
       (session.role==='jury'?button('Переключиться на клиента','role','buyer'):button('Войти в кабинет','customer-login','')):'')+
-    (d?.status==='resolved'?button('Начать новый чат','new-dialog',''):(!d?'<div class="quick-actions">'+starters+'</div>':'')+composer('message',buyerDraft))+
+    (!referenceDraft && d?.status!=='resolved' && choices.length ? '<div class="quick-actions">'+
+      choices.map(value=>button(value,'chat-choice',value)).join('')+'</div>' : '')+
+    (d?.status==='resolved'?button('Начать новый чат','new-dialog',''):(!d || referenceDraft?'<div class="quick-actions">'+starters+'</div>':'')+composer('message',buyerDraft))+
     '</div></section>';
 }
 function composer(action,draft,id='') {
   const quote=quoteDraft?'<div class="composer-note"><blockquote><b>'+escape(label(quoteDraft.role))+'</b><div>'+escape(displayText(quoteDraft.preview))+'</div></blockquote>'+
     iconButton('close','Убрать цитату','clear-quote')+'</div>':'';
   const file=fileDraft?'<div class="composer-note"><span>'+escape(fileDraft.name)+'</span>'+iconButton('close','Убрать файл','clear-file')+'</div>':'';
-  return form(action,(id?hidden('dialog_id',id):'')+quote+file+
+  const reference=action==='message' && referenceDraft?'<div class="composer-note"><span class="message-reference">'+icon('attach')+
+    escape(displayText(referenceDraft.label))+'</span>'+iconButton('close','Убрать позицию','clear-reference')+'</div>':'';
+  return form(action,(id?hidden('dialog_id',id):'')+quote+file+reference+
     '<div class="composer-line"><input type="file" hidden>'+iconButton('attach','Прикрепить файл','attach')+
     '<textarea name="text" rows="2" maxlength="4000" aria-label="Сообщение">'+escape(draft)+'</textarea>'+
     iconButton('emoji','Выбрать эмодзи','emoji-picker')+iconButton('send','Отправить сообщение','')+'</div>'+
@@ -344,42 +428,82 @@ function chatHistory() {
     return '<details><summary>'+escape(group[0].title.slice(0,100))+' ('+group.length+')</summary>'+group.map(entry).join('')+'</details>';
   },'Чатов пока нет.');
 }
+const catalogOffers = () => selectedOffer && result?.offers ? list(result.offers) :
+  catalogSearch?.offers ?? list(state.catalog ?? state.offers).slice(0,8);
 function catalogPage() {
-  const offers = result?.offers && (result.query!==undefined || selectedOffer) ? list(result.offers) : list(state.offers).slice(0,8);
   const context = clientContext();
-  return panel('Каталог программ',form('search',field('Товар или задача','query',result?.query ?? '', 'required maxlength="220"')+submit('Найти'))+
-    '<p class="muted">Помощник учитывает выделенный товар. Чтобы выбрать другой, раскройте «О товаре».</p>'+
-    rows(offers, offer => {
+  const page=catalogSearch?.page ?? 1;
+  const hasMore=catalogSearch?.hasMore ?? state.catalog_has_more;
+  const pagination=!selectedOffer && (hasMore || page>1)?'<nav class="catalog-pages" aria-label="Страницы каталога">'+
+    button('Назад','catalog-page',page-1,page===1?'disabled':'')+'<span>Страница '+num(page)+'</span>'+
+    button('Дальше','catalog-page',page+1,hasMore?'':'disabled')+'</nav>':'';
+  return '<section aria-label="Каталог программ">'+form('search','<div class="catalog-search"><input type="search" name="query" aria-label="Поиск по каталогу" value="'+
+    attr(catalogSearch?.query ?? '')+'" maxlength="220">'+submit('Найти')+'</div>')+
+    '<div class="catalog-grid">'+
+    rows(catalogOffers(), offer => {
+      const grouped=Boolean(offer.group_name);
       const id = String(offer.id);
-      const url = safeUrl(offer.url);
+      const url = grouped?'':safeUrl(offer.url);
       const approved=activeDialog()?.approved_discount;
       const minimum=quantityOf(offer), maximum=offer.max_quantity || 100000;
-      const viewed=String(context.viewed?.id)===id;
-      return '<article class="product" data-viewed="'+viewed+'"><h3>'+escape(displayText(offer.name))+'</h3><p><b>'+offerPrice(offer,false)+'</b></p>'+
-        '<details data-product="'+attr(id)+'" '+(openProducts.has(id)?'open':'')+'><summary>О товаре</summary>'+
-        (offer.description && offer.description!==offer.name?'<p>'+escape(displayText(offer.description))+'</p>':'')+quantityTerms(offer)+'</details>'+
-        '<div class="row">'+(url?'<a href="'+attr(url)+'" data-product-link="'+attr(id)+'" target="_blank" rel="noreferrer">Карточка товара</a>':'')+
-        (context.cart.has(id)?button('В корзине','tab','cart'):button('Добавить в корзину','cart-add',id))+'</div>'+
-        (offer.available && String(offer.id)===selectedOffer ? form('document',hidden('offer_id',offer.id)+hidden('expected_price',offer.price)+field('Количество','quantity',minimum,'type="number" min="'+minimum+'" max="'+maximum+'" required')+
+      const viewed=grouped?context.viewed?.group_name && context.viewed.group_id===offer.group_id:String(context.viewed?.id)===id;
+      const name=displayText(offer.group_name || offer.name);
+      const brand=displayText(offer.vendor || name.split(/\s+/)[0]);
+      const color=Array.from(String(offer.group_id || id)).reduce((sum,char)=>sum+char.charCodeAt(0),0)%4;
+      const description=grouped?'':offerDetails(offer).description;
+      return '<article class="product" data-viewed="'+Boolean(viewed)+'"><button class="product-select" type="button" data-do="select-product" data-value="'+attr(id)+
+        '" aria-label="'+attr('Выбрать '+name)+'" aria-pressed="'+Boolean(viewed)+'"></button>'+
+        '<div class="product-art product-art-'+color+'" aria-hidden="true"><div class="product-cover">'+escape(brand)+'</div></div>'+
+        iconButton('question','Спросить о товаре','ask-product',id,'product-question')+
+        '<div class="product-copy">'+(offer.category?'<p class="product-category">'+escape(offer.category)+'</p>':'')+'<h3>'+escape(name)+'</h3>'+
+        (description && description!==offer.name?'<p>'+escape(description)+'</p>':'')+(grouped?'':quantityTerms(offer))+'</div>'+
+        '<div class="product-bottom">'+(grouped?'':'<strong>'+offerPrice(offer,false)+'</strong>')+'<div class="product-actions">'+
+        (grouped?button('Подобрать лицензию','choose-group',id,'class="primary"'):cartControls(offer, context.cart.get(id)))+
+        (url?'<a class="chat-icon" href="'+attr(url)+'" target="_blank" rel="noreferrer" aria-label="Карточка на сайте" title="Карточка на сайте">'+icon('external')+'</a>':'')+'</div></div>'+
+        (offer.price>0 && role!=='guest' && String(offer.id)===selectedOffer ? form('document',hidden('offer_id',offer.id)+hidden('expected_price',offer.price)+field('Количество','quantity',minimum,'type="number" min="'+minimum+'" max="'+maximum+'" required')+
           (approved?.offer_id===offer.id?'<p>Согласованная скидка '+num(approved.rate)+'%</p>':'')+
           '<div class="row"><button class="primary" name="kind" value="invoice">Получить счёт</button><button name="kind" value="proposal">Получить КП</button></div>'):'')+'</article>';
-    },'Товары не найдены. Уточните запрос.'));
+    },catalogSearch?.query?'Товары не найдены. Уточните запрос.':'Товаров пока нет.')+'</div>'+pagination+'</section>';
+}
+function cartControls(offer, line) {
+  if (!(offer.price>0)) return button('Запросить цену','price-request',offer.id);
+  if (!line) return iconButton('cart','Добавить в корзину','cart-add',offer.id,'primary');
+  const plus=line.quantity<(offer.max_quantity || 100000);
+  return '<div class="quantity">'+iconButton('minus','Уменьшить количество','cart-minus',offer.id)+
+    '<span aria-live="polite">'+num(line.quantity)+'</span>'+
+    (plus?iconButton('plus','Увеличить количество','cart-plus',offer.id):'<span aria-label="Максимальное количество">'+icon('plus')+'</span>')+'</div>';
 }
 function cartPage() {
   const cart = [...clientContext().cart.values()];
-  return panel('Корзина', rows(cart, offer => item(displayText(offer.name),
-    '<p>'+num(quantityOf(offer))+' шт.</p>'+button('Убрать из корзины','cart-remove',offer.id)),
-  'В корзине пока ничего нет. Добавьте товар из каталога.'));
+  return '<section class="panel" aria-label="Корзина">'+rows(cart, ({offer,quantity}) => item(displayText(offer.name),
+    '<div class="row">'+cartControls(offer,{offer,quantity})+button('Удалить','cart-remove',offer.id)+
+    iconButton('question','Спросить о товаре','ask-cart-product',offer.id)+'</div>'),
+  'В корзине пока ничего нет. Добавьте товар из каталога.')+'</section>';
 }
-function ordersPage() {
-  return panel('Заказы',rows(list(state.orders),o=>item(o.name ?? o.product_name ?? o.id,
-    '<p>'+escape(o.id)+'</p>'+button('Проверить статус','order',o.id)),'Заказов пока нет.')+
-    (result?.order ? '<p class="note">'+escape(result.order.status)+' · '+escape(result.order.license_status ?? result.order.delivery_date ?? '')+'</p>':'')+
-    '<h3>Лицензии</h3>'+rows(clientContext().licenses, offer=>'<p>'+escape(displayText(offer.name))+'</p>','Лицензий пока нет.'));
+function documentDescription(d) {
+  const name=d.name ?? d.product_name ?? d.filename ?? '';
+  if (d.quantity==null) return name;
+  if (/количество почтовых ящиков\s*$/i.test(name)) return name+': '+num(d.quantity);
+  return name+'. Количество: '+num(d.quantity);
 }
-function docsPage() {
-  return panel('Документы',rows(list(state.documents),d=>item((label(d.kind ?? d.type)||'Документ')+' '+(d.number ?? d.id),
-    '<p>'+escape(d.name ?? d.product_name ?? d.filename)+'</p><p>'+escape(num(d.total))+' '+escape(d.currency)+'</p>'+button('Скачать','download',d.id)),'Документов пока нет. Выберите товар в каталоге.'));
+function paymentsPage() {
+  const documents=list(state.documents);
+  const payments=list(state.orders);
+  const settled=payments.map(o=>item(o.name ?? o.id,'<div class="row"><span>'+escape(o.id)+' · '+escape(o.status)+'</span>'+
+    iconButton('question','Спросить о заказе','ask-order',o.id)+'</div>')).join('');
+  const files=documents.map(d=>item((label(d.kind ?? d.type)||'Документ')+' '+(d.number ?? d.id),
+    '<p>'+escape(documentDescription(d))+'</p><div class="row"><span>'+escape(num(d.total))+' '+escape(d.currency)+'</span>'+
+    iconButton('download',label(d.kind ?? d.type)==='КП'?'Скачать КП':'Скачать счёт','download',d.id)+
+    iconButton('question','Спросить о документе','ask-document',d.id)+'</div>')).join('');
+  return '<section class="panel" aria-label="Счета и платежи">'+(files+settled || '<p class="muted">Счетов, КП и платежей пока нет.</p>')+'</section>';
+}
+function keysPage() {
+  return '<section class="panel" aria-label="Дистрибутивы и ключи">'+rows(list(state.licenses),license=>{
+    const info=license.status==='expired'?'Срок лицензии истёк':'<code>'+escape(license.key)+'</code>'+
+      iconButton('copy','Скопировать ключ','copy-license',license.id)+iconButton('download','Скачать учебный файл лицензии','download-license',license.id);
+    return item(displayText(license.name),'<p>'+escape(license.id)+'</p><div class="row">'+info+
+      iconButton('question','Спросить о лицензии','ask-license',license.id)+'</div>');
+  },'Ключей пока нет.')+'</section>';
 }
 
 function staffPage() {
@@ -469,7 +593,21 @@ function reviewSource(value) {
   if (!value) return '';
   const url=safeUrl(value);
   return url ? '<p><a href="'+attr(url)+'" target="_blank" rel="noreferrer">Источник ответа</a></p>' :
-    '<p class="muted">Источник '+escape(value==='xml'?'Каталог':value)+'</p>';
+    '<p class="muted">Источник '+escape(value==='xml'?'Каталог':value==='synthetic'?'Учебный каталог':value)+'</p>';
+}
+function replaySteps(run) {
+  const actions = {clarify:'Уточнение',shortlist:'Подборка',inform:'Справка',handoff:'Передача менеджеру',confirm_offer:'Проверка позиции'};
+  const needs = {intent:'тема обращения',discount_acceptance:'согласие на 5%',product:'товар',seats:'число мест',article:'артикул'};
+  const steps = list(run.steps).map((step,i)=>'<details><summary>'+(step.separate?'Отдельная проверка ':'Шаг ')+(i+1)+'. '+escape(actions[step.action] || label(step.action || 'Ответ'))+'</summary>'+
+    '<blockquote>'+escape(step.fragment)+'</blockquote>'+
+    (step.intent?'<p>'+escape(({discount:'Подходит ли покупателю скидка?',unclear:'Понятна ли тема обращения?',selection:'Какая позиция подходит?',security:'Какая защита нужна?'})[step.intent] || 'Как обработать эту просьбу?')+'</p>':'')+
+    (step.evidence?.length?'<p>Основание: '+step.evidence.map(escape).join(', ')+'</p>':'')+
+    (step.missing?.length?'<p>Нужно уточнить: '+step.missing.map(k=>escape(needs[k] || label(k))).join(', ')+'</p>':'')+
+    '<p>'+escape(step.text)+'</p>'+reviewSource(step.source)+(step.template?'<p>Шаблон '+escape(step.template)+'</p>':'')+'</details>').join('');
+  const v=run.variants || {};
+  return steps+(v.scenario?'<details><summary>Варианты исходного ответа</summary><p>'+escape(run.original_template?'Шаблон '+run.original_template:'Сценарный ответ')+'</p><blockquote>'+escape(v.scenario)+'</blockquote>'+
+    (v.draft?'<p>Черновик модели</p><blockquote>'+escape(v.draft)+'</blockquote>':'')+
+    (v.reason?'<p>'+escape(v.reason)+'</p>':'')+'<p>'+escape(run.model_failed?'Сбой модели. Использован сценарный ответ.':run.model_published?'Использовано уточнение модели.':'Использован сценарный ответ.')+'</p></details>':'');
 }
 function reviewsPage() {
   const replay=result?.replay;
@@ -484,6 +622,7 @@ function reviewsPage() {
       (current?' · Оценка '+escape(current==='-'?'−':current):'')+'</summary>'+
       '<div class="review-answers"><div><h3>Исходный ответ</h3><p>'+escape(r.answer)+'</p>'+reviewSource(r.source)+'</div>'+
       (comparison?'<div><h3>Повтор на текущем сценарии</h3><p>'+escape(comparison.answer)+'</p>'+reviewSource(comparison.source)+'</div>':'')+'</div>'+
+      (comparison?replaySteps(comparison):'')+
       '<p class="muted">Версия исходного ответа '+escape(r.version)+'</p>'+
       form('review_replay',ids+submit('Повторить сценарий'))+
       form('review',ids+area('Закрытый комментарий','note','','maxlength="1500"')+
@@ -494,39 +633,20 @@ function journalPage() {
   const reviews = list(state.reviews);
   const journal = list(state.journal ?? state.audit);
   const actions = {message:'Сообщение',reply:'Ответ менеджера',claim:'Взятие обращения',reassign:'Передача обращения',resolve:'Закрытие обращения',review:'Оценка ответа',review_replay:'Повтор сценария',availability:'Доступность менеджера',moderate:'Разметка обращения',sample_classify:'Разметка записи',template_draft:'Правка шаблона',template_emulate:'Проверка шаблона',template_publish:'Публикация шаблона',template_delete:'Удаление черновика',template_rollback:'Восстановление версии',feed_import:'Загрузка каталога',buyer_select:'Смена профиля клиента',invoice:'Счёт',proposal:'КП',copilot:'Подсказка'};
-  return panel('Журнал',handoffStats()+stats([['Оценок',num(reviews.length)]])+rows(journal,e=>item(e.title ?? actions[e.action] ?? e.action ?? e.event,'<p>'+escape(e.at ?? e.created_at)+' '+escape(label(e.role ?? e.actor))+'</p>'),'Записей пока нет.')+
+  return panel('Журнал',stats([['Оценок',num(reviews.length)]])+rows(journal.filter(e=>e.action!=='feed_import'),e=>item(e.title ?? actions[e.action] ?? e.action ?? e.event,'<p>'+escape(e.at ?? e.created_at)+' '+escape(label(e.role ?? e.actor))+'</p>'),'Записей пока нет.')+
     '<h3>Оценки ответов</h3>'+rows(reviews,r=>item((r.rating ?? r.label ?? 'Разметка')+' · '+(r.dialog_id ?? r.sample_id ?? ''),
       '<p>'+escape(r.note)+' '+escape(r.at ?? r.created_at)+'</p>'),'Оценок пока нет.'));
 }
-function handoffStats() {
-  const data=state.handoff_stats;
-  if (!data || !Number.isInteger(data.dialogs)) return '';
-  const count=data.dialogs ?? 0;
-  const first=data.first_request ?? 0;
-  const dateTime=new Intl.DateTimeFormat('ru-RU',{dateStyle:'short',timeStyle:'short',timeZone:'Europe/Moscow'});
-  const date=value=>value && Number.isFinite(Date.parse(value)) ? dateTime.format(new Date(value)) : '';
-  const start=date(data.period_start);
-  const end=date(data.period_end);
-  const share=count ? new Intl.NumberFormat('ru-RU',{style:'percent',maximumFractionDigits:1}).format(first/count) : 'Нет обращений';
-  const context=session.role==='jury' ? 'Учебные обращения' : 'Обращения стенда';
-  return '<section class="form"><h3>Запросы менеджера и передачи</h3><p class="muted">'+context+
-    (start && end?' · '+escape(start)+' — '+escape(end)+' МСК':'')+'</p>'+
-    stats([['В первой реплике',num(first)+' из '+num(count)+' · '+share],['Запросили позже',num(data.later_request ?? 0)],['Переданы автоматически',num(data.automatic ?? 0)]])+'</section>';
-}
 function standPage() {
-  const feed = state.feed ?? {};
-  const changes = feed.changes ?? {};
-  const counts = feed.metrics ?? state.metrics?.feed ?? (Array.isArray(changes)?{updated:changes.length}:changes);
   const providerNames={jev:'Jev',cloud:'Облачная модель',nimble:'Nimble',local_llm:'Локальная модель'};
   const usage=Object.entries(state.usage ?? {}).filter(([,value])=>value.calls>0);
-  return '<details class="form catalog-settings" id="catalog-settings" '+(catalogExpanded?'open':'')+'><summary>Версии каталога и изменения цен</summary>'+
-    stats([['Версия каталога',num(feed.day)],['Товаров',num(feed.count)],...Object.entries({added:'Добавлено',removed:'Удалено',updated:'Обновлено'})
-    .filter(([key])=>counts[key]!=null).map(([key,title])=>[title,num(Array.isArray(counts[key])?counts[key].length:counts[key])])])+
-    '<div class="row">'+button('Загрузить каталог за день 1','feed_import',1)+button('Загрузить каталог за день 2','feed_import',2)+'</div>'+
-    (Array.isArray(changes)&&changes.length?changes.map(change=>item(change.id,'<p>Было '+num(change.before)+' · Стало '+num(change.price)+'</p>')).join(''):'')+'</details>'+
-    (usage.length?'<details class="form"><summary>Запросы к моделям</summary>'+usage.map(([key,value])=>item(providerNames[key] ?? key,'<p>Запросов '+num(value.calls)+' · С учётом токенов '+num(value.metered_calls)+'</p>')).join('')+'</details>':'')+
-    (session.role==='jury' && role==='buyer'?'<div class="form"><h3>Профиль клиента</h3>'+choices(Object.entries(state.client_profiles ?? {}),'buyer_select',state.buyer_id)+
-      '<div class="row">'+button('Очистить историю обращений','clear-history','')+'</div></div>':'');
+  const feed=state.feed ?? {};
+  const changes=rows(list(feed.changes),c=>item(c.article || c.id,'<p>'+escape(num(c.before))+' → '+
+    escape(num(c.price))+' '+escape(c.currency ?? '')+'</p>'),'Изменений цен нет.');
+  return '<h3>Версия учебного каталога</h3><div class="quick-actions">'+
+    [1,2].map(day=>button('Версия '+day,'catalog-day',day,day===feed.day?'disabled':'')).join('')+
+    '</div><h3>Изменившиеся артикулы</h3>'+changes+'<h3>Вызовы моделей</h3>'+rows(usage,([key,value])=>item(providerNames[key] ?? key,
+    '<p>Запросов '+num(value.calls)+' · С учётом токенов '+num(value.metered_calls)+'</p>'),'Запросов к моделям пока нет.');
 }
 function showError(error) {
   errorText = error.message;
@@ -591,10 +711,13 @@ app.addEventListener('submit', event => {
       p.mode=buyerMode;
       if (dialogId) p.dialog_id=dialogId;
       const context = clientContext();
-      if (tab==='cart') {
-        p.page_context={type:'basket',items:[...context.cart.values()].map(offer=>({offer_id:String(offer.id),quantity:quantityOf(offer)}))};
+      if (referenceDraft) {
+        p.reference={type:referenceDraft.type,id:referenceDraft.id};
+      } else if (tab==='cart' || /корзин/i.test(p.text)) {
+        p.page_context={type:'basket',items:[...context.cart.values()].map(({offer,quantity})=>({offer_id:String(offer.id),quantity}))};
       } else if ((!tab || tab==='catalog') && context.viewed) {
-        p.viewed_offer_id=String(context.viewed.id);
+        if (context.viewed.group_name) p.viewed_group_id=String(context.viewed.group_id);
+        else p.viewed_offer_id=String(context.viewed.id);
       }
     }
     if (message && quoteDraft) {
@@ -614,46 +737,25 @@ app.addEventListener('submit', event => {
       delete p.kind;
       if (dialogId) p.dialog_id=dialogId;
       await act(kind,p);
-      if (result.document) { chatOpen=false; tab='docs'; selectedOffer=''; }
+      if (result.document) { chatOpen=false; tab='payments'; selectedOffer=''; }
       else if (result.dialog) chatOpen=true;
       return;
     }
+    if (action==='search') { await loadCatalog(p.query.trim(),1); return; }
     await act(action,p);
     if (action==='copilot' && !training) staffDraft=result.text ?? '';
     if (message) {
       clearComposer();
       if (action==='message' && messageRole(list(result.dialog?.messages).at(-1) ?? {})==='assistant') notifyMessage();
     }
-    if (action==='search') result={...result,query:p.query};
   }, event.submitter, ()=>{
+    if (action==='search') app.querySelector('.catalog-search input')?.focus();
     app.querySelector('[data-action="'+action+'"] textarea')?.focus();
     const thread=app.querySelector(action==='reply'?'.staff-thread':'.thread');
     if (thread) thread.scrollTop=thread.scrollHeight;
   });
 });
-app.addEventListener('toggle',event=>{
-  if (event.target.id==='jury-stand') standExpanded=event.target.open;
-  if (event.target.id==='catalog-settings') catalogExpanded=event.target.open;
-},true);
-const catalogOffer = id => [...list(result?.offers),...list(state.offers)].find(offer=>String(offer.id)===id);
-app.addEventListener('click',event=>{
-  const summary=event.target.closest('details[data-product] > summary');
-  const link=event.target.closest('[data-product-link]');
-  if (summary) {
-    event.preventDefault();
-    const {product:id}=summary.parentElement.dataset;
-    if (openProducts.has(id)) openProducts.delete(id);
-    else {
-      openProducts.add(id);
-      clientContext().viewed=catalogOffer(id);
-    }
-    render();
-    [...app.querySelectorAll('details[data-product]')].find(details=>details.dataset.product===id)?.querySelector('summary')?.focus();
-  } else if (link) {
-    clientContext().viewed=catalogOffer(link.dataset.productLink);
-    for (const card of app.querySelectorAll('.product')) card.dataset.viewed=String(card.contains(link));
-  }
-});
+const catalogOffer = id => catalogOffers().find(offer=>String(offer.id)===id);
 let selectedQuote='';
 function selectedExcerpt(control) {
   const selection=getSelection();
@@ -666,7 +768,7 @@ app.addEventListener('pointerdown',event=>{
   selectedQuote=reply?selectedExcerpt(reply):'';
 });
 document.addEventListener('click', event => {
-  if (chatOpen && storefront() && !event.target.closest('.widget')) {
+  if (chatOpen && storefront() && !event.target.closest('.widget, .buyer-layout, .shop')) {
     chatOpen=false;
     chatPane='';
     const widget=app.querySelector('.widget');
@@ -698,7 +800,7 @@ document.addEventListener('click', event => {
     return;
   }
   if (action==='chat-file') { downloadChatFile(value).catch(showError); return; }
-  if (['open-chat','sound','dialog'].includes(action)) {
+  if (['open-chat','sound','dialog'].includes(action) || action.startsWith('ask-')) {
     if (!audioContext && window.AudioContext) audioContext=new AudioContext();
     audioContext?.resume().catch(()=>{});
   }
@@ -715,7 +817,7 @@ document.addEventListener('click', event => {
       case 'guest-start':
         await signIn(guestToken());
         dialogId=sessionStorage.getItem('softline-guest-dialog') || undefined;
-        chatOpen=true;
+        chatOpen=Boolean(dialogId);
         break;
       case 'customer-login':
         if (dialogId) sessionStorage.setItem('softline-guest-dialog',dialogId);
@@ -724,8 +826,24 @@ document.addEventListener('click', event => {
         session=state=role=tab=result=undefined;
         token='';
         break;
+      case 'catalog-day': await act('feed_import',{day:Number(value),request_id:crypto.randomUUID()}); break;
+      case 'chat-choice': await act('message',{dialog_id:dialogId,text:value,mode:'rules',request_id:control.dataset.requestId ??= crypto.randomUUID()}); break;
+      case 'context-question': {
+        const offer=clientContext().viewed;
+        const reference=referenceDraft ?? {type:offer.group_name?'group':'offer',id:String(offer.group_id ?? offer.id)};
+        await act('message',{dialog_id:dialogId,text:value,mode:'rules',reference:{type:reference.type,id:reference.id},
+          request_id:control.dataset.requestId ??= crypto.randomUUID()});
+        clearComposer();
+        break;
+      }
       case 'starter': {
         const viewedOffer=clientContext().viewed;
+        if (viewedOffer?.group_name && value==='viewed') {
+          await act('message',{text:'Помогите подобрать лицензию для «'+viewedOffer.group_name+'»',mode:'rules',
+            viewed_group_id:viewedOffer.group_id,request_id:control.dataset.requestId ??= crypto.randomUUID()});
+          break;
+        }
+        if (viewedOffer?.group_name) clientContext().viewed=undefined;
         const text=value==='viewed'?'Расскажите о товаре «'+viewedOffer.name+'»':control.textContent;
         await act('message',{text,mode:'rules',starter:value,offer_id:viewedOffer?.id,request_id:control.dataset.requestId ??= crypto.randomUUID()});
         break;
@@ -750,6 +868,7 @@ document.addEventListener('click', event => {
       }
       case 'clear-quote': quoteDraft=undefined; break;
       case 'clear-file': fileDraft=undefined; break;
+      case 'clear-reference': referenceDraft=undefined; break;
       case 'end-chat': await act('end_chat',{dialog_id:value}); clearComposer(); chatPane=''; break;
       case 'clear-history': await act('clear_history',{}); clearComposer(); dialogId=undefined; chatPane=''; break;
       case 'logout':
@@ -768,12 +887,71 @@ document.addEventListener('click', event => {
         }
         break;
       case 'tab': tab=value; result=undefined; break;
+      case 'catalog-page': await loadCatalog(catalogSearch?.query ?? '',Number(value)); break;
+      case 'ask-product':
+      case 'ask-cart-product':
+      case 'ask-order':
+      case 'ask-document':
+      case 'ask-license': {
+        const kind=action.slice(4);
+        const offer=kind==='product'?catalogOffer(value):kind==='cart-product'?clientContext().cart.get(value)?.offer:undefined;
+        const record=offer ?? list(state[kind==='document'?'documents':kind+'s']).find(row=>String(row.id)===value);
+        if (!record) break;
+        if (activeDialog()?.status==='resolved') { dialogId=undefined; clearComposer(); }
+        if (kind==='product') clientContext().viewed=offer;
+        const type=offer?(offer.group_name?'group':'offer'):kind;
+        const title=kind==='order'?'Заказ '+record.id+' · '+record.name :
+          kind==='document'?(label(record.kind ?? record.type)||'Документ')+' '+(record.number ?? record.id) :
+          record.group_name || record.name;
+        referenceDraft={type,kind:kind==='cart-product'?'cart':type,id:String(type==='group'?record.group_id:record.id),label:title};
+        chatOpen=launcherSeen=true;
+        chatPane='';
+        break;
+      }
+      case 'select-product':
+      case 'choose-group': {
+        const offer=catalogOffer(value);
+        if (!offer) break;
+        clientContext().viewed=offer;
+        if (action!=='select-product') {
+          if (activeDialog()?.status==='resolved') { dialogId=undefined; clearComposer(); }
+          chatOpen=launcherSeen=true;
+          chatPane='';
+        }
+        if (action==='choose-group') {
+          referenceDraft=undefined;
+          const payload={text:'Подобрать лицензию',mode:'rules',
+            reference:{type:'group',id:String(offer.group_id)},request_id:control.dataset.requestId ??= crypto.randomUUID()};
+          if (dialogId) payload.dialog_id=dialogId;
+          await act('message',payload);
+        }
+        break;
+      }
       case 'cart-add': {
         const {cart}=clientContext();
         const offer=catalogOffer(value);
         if (!offer) break;
         if (cart.size>=20) throw Error('В корзине уже 20 позиций. Уберите одну, чтобы добавить товар.');
-        cart.set(value,offer);
+        cart.set(value,{offer,quantity:quantityOf(offer)});
+        break;
+      }
+      case 'chat-cart': {
+        const {cart}=clientContext();
+        const offer=list(activeDialog()?.messages).flatMap(message=>list(message.offers))
+          .findLast(option=>String(option.id)===value && option.group_recommendation && option.available);
+        if (!offer || cart.has(value)) break;
+        if (cart.size>=20) throw Error('В корзине уже 20 позиций. Уберите одну, чтобы добавить товар.');
+        cart.set(value,{offer,quantity:offer.suggested_quantity});
+        break;
+      }
+      case 'cart-plus':
+      case 'cart-minus': {
+        const {cart}=clientContext();
+        const line=cart.get(value);
+        if (!line) break;
+        if (action==='cart-plus') line.quantity=Math.min(line.quantity+1,line.offer.max_quantity || 100000);
+        else if (line.quantity<=quantityOf(line.offer)) cart.delete(value);
+        else line.quantity--;
         break;
       }
       case 'cart-remove': clientContext().cart.delete(value); break;
@@ -788,18 +966,34 @@ document.addEventListener('click', event => {
       }
       case 'sample-page': samplePage=Number(value); break;
       case 'price-request': {
-        await act('price_request',{offer_id:value,request_id:crypto.randomUUID()});
+        await act('price_request',{offer_id:value,dialog_id:activeDialog()?.status==='resolved'?'':dialogId,
+          request_id:control.dataset.requestId ??= crypto.randomUUID()});
         chatOpen=true;
         break;
       }
-      case 'order': await act('order_status',{order_id:value}); break;
       case 'download': await act('download',{document_id:value}); break;
+      case 'copy-license':
+      case 'download-license': {
+        const offer=list(state.licenses).find(item=>String(item.id)===value);
+        if (!offer?.key) break;
+        if (action==='copy-license') {
+          try { await navigator.clipboard.writeText(offer.key); }
+          catch { throw Error('Не удалось скопировать ключ. Выделите его и скопируйте вручную.'); }
+          errorText='Ключ скопирован.';
+        } else {
+          const href=URL.createObjectURL(new Blob([displayText(offer.name)+'\n'+offer.key+'\nУчебные сведения о лицензии.\n'],{type:'text/plain;charset=utf-8'}));
+          const link=document.createElement('a');
+          link.href=href;
+          link.download='license-demo.txt';
+          link.click();
+          setTimeout(()=>URL.revokeObjectURL(href),1000);
+        }
+        break;
+      }
       case 'availability': await act(action,{available:value==='true'}); break;
       case 'rate': await act('review',{dialog_id:dialogId,message_id:value,rating:control.dataset.rating}); break;
       case 'claim':
       case 'resolve': await act(action,{dialog_id:value}); break;
-      case 'buyer_select': await act(action,{buyer_id:value}); resetWorkspace(); dialogId=result=undefined; break;
-      case 'feed_import': await act(action,{day:Number(value)}); break;
       case 'template_delete':
         if (!window.confirm('Удалить черновик?')) break;
         await act(action,{template_id:value}); break;
@@ -807,7 +1001,11 @@ document.addEventListener('click', event => {
       case 'template_rollback': await act(action,{template_id:value}); break;
     }
   },control,()=>{
-    if (['quote','clear-quote','clear-file','chat-thread'].includes(action)) {
+    if (action==='catalog-page') {
+      app.querySelector('.catalog-search input')?.focus();
+      return;
+    }
+    if (['quote','clear-quote','clear-file','clear-reference','chat-thread'].includes(action)) {
       app.querySelector('.composer-line textarea')?.focus();
       return;
     }
@@ -815,12 +1013,24 @@ document.addEventListener('click', event => {
       const thread=app.querySelector('.staff-thread');
       if (thread) thread.scrollTop=thread.scrollHeight;
     }
-    if (chatOpen && ['open-chat','starter','new-dialog','open-dialog'].includes(action)) {
+    if (chatOpen && (action.startsWith('ask-') || ['open-chat','choose-group','starter','new-dialog','open-dialog'].includes(action))) {
       (app.querySelector('.widget textarea') ?? app.querySelector('.widget-head button'))?.focus();
       const thread=app.querySelector('.thread'); if (thread) thread.scrollTop=thread.scrollHeight;
+      return;
+    }
+    if (action==='chat-choice' || action==='context-question' || action==='price-request') {
+      const thread=app.querySelector('.thread');
+      if (thread) thread.scrollTop=thread.scrollHeight;
+      (app.querySelector('[data-do="chat-choice"]') ?? app.querySelector('.widget textarea'))?.focus({preventScroll:true});
+      return;
     }
     if (action==='close-chat') app.querySelector('.launcher')?.focus();
-    [...document.querySelectorAll('button[data-do]')].find(button=>button.dataset.do===action && button.dataset.value===value)?.focus();
+    const buttons=[...document.querySelectorAll('button[data-do]')];
+    const focus=buttons.find(button=>button.dataset.do===action && button.dataset.value===value);
+    if (focus) focus.focus();
+    else if (['cart-add','cart-minus','cart-plus'].includes(action)) {
+      buttons.find(button=>button.dataset.value===value && ['cart-minus','cart-add','cart-plus'].includes(button.dataset.do))?.focus();
+    }
   });
 });
 app.addEventListener('input',event=>{
@@ -829,6 +1039,14 @@ app.addEventListener('input',event=>{
 });
 app.addEventListener('change',event=>{
   if (event.target.matches('#jury-stand select[name="mode"]')) { buyerMode=event.target.value; render(); }
+  if (event.target.matches('#jury-stand select[name="client_profile"]')) {
+    const control=event.target;
+    run(async ()=>{
+      await act('buyer_select',{buyer_id:control.value});
+      resetWorkspace();
+      dialogId=result=undefined;
+    },control,()=>app.querySelector('[name="client_profile"]')?.focus());
+  }
   if (event.target.matches('.composer-line input[type=file]')) {
     const file=event.target.files[0];
     if (!file) return;
@@ -876,6 +1094,9 @@ setInterval(async ()=>{
       if (updated.status==='resolved') footer.replaceWith(markup.content.querySelector('.chat-foot'));
       else {
         footer.querySelector('.handoff')?.remove();
+        footer.querySelector('.quick-actions')?.remove();
+        const suggestions=markup.content.querySelector('.chat-foot .quick-actions');
+        if (suggestions) footer.prepend(suggestions);
         const status=markup.content.querySelector('.handoff');
         if (status) footer.prepend(status);
       }

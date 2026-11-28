@@ -2,6 +2,7 @@
 import json
 import os
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from .core import Store
 from .integrations import IntegrationEngine, HybridEngine
@@ -25,6 +26,7 @@ def build_store(db, feed, corpus, runtime_dir):
             hybrid.get('cloud_url'), hybrid.get('cloud_model'), os.environ.get('TYPESAFE_API_KEY'),
             os.environ.get('SUPPORT_CLOUD_API_KEY'), cloud_generator=generate_public if provider == 'codex' else None)
     store = Store(db, feed, corpus, engine=engine, hybrid_engine=hybrid_engine)
+    store.business_hours = lambda: 9 <= (datetime.now(timezone.utc).hour + 3) % 24 < 19
     store.runtime_config = config
     return store
 
