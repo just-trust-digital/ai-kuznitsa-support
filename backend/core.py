@@ -301,6 +301,11 @@ class Store:
         return offer
 
     def _search(self, db, state, query="", limit=12, *, by_product=False, offset=0):
+        identifier = query.strip()
+        if identifier:
+            exact = db.execute("SELECT body FROM offers WHERE id=?", (identifier,)).fetchone()
+            if exact:
+                return [] if offset else [self._offer(exact[0], state)]
         words = re.findall(r"\w+", search_key(query))[:8]
         conditions, args = [], []
         for word in words:
