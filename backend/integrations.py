@@ -1,5 +1,7 @@
 """Explicit model adapters. No network call unless configured by the operator."""
 import json
+import os
+import re
 import urllib.request
 import urllib.error
 from urllib.parse import urlsplit
@@ -38,7 +40,7 @@ def parse_decision(result):
 
 
 USAGE_FIELDS = ("calls", "metered_calls", "input_tokens", "output_tokens")
-PROVIDERS = ("nimble", "local_llm", "jev", "cloud")
+PROVIDERS = ("nimble", "local_llm", "jev", "clef", "cloud")
 
 
 def invoke(transport, usage, provider, token_fields, *args):
@@ -241,13 +243,17 @@ class IntegrationEngine:
 
 class HybridEngine:
     """Only operator-approved public catalog records cross the cloud boundary."""
-    def __init__(self, catalog, kb_urls, jev_model, cloud_url, cloud_model, jev_key, cloud_key, transport=post, cloud_generator=None):
+    def __init__(self, catalog, kb_urls, jev_model, cloud_url, cloud_model, jev_key, cloud_key, transport=post, cloud_generator=None, clef_account=None, clef_token=None):
         if cloud_generator is None and urlsplit(cloud_url or '').scheme != 'https':
             raise ValueError('Cloud endpoint requires HTTPS')
         self.catalog, self.kb_urls = catalog, tuple(kb_urls)
         self.jev_model, self.cloud_url, self.cloud_model = jev_model, cloud_url, cloud_model
         self.jev_key, self.cloud_key, self.transport = jev_key, cloud_key, transport
         self.cloud_generator = cloud_generator
+        if clef_account is not None and (not re.fullmatch(r'[0-9a-fA-F]{32}', clef_account) or not clef_token):
+            raise ValueError('Clef requires a Cloudflare account and Workers AI token')
+        self.clef_url = f'https://api.cloudflare.com/client/v4/accounts/{clef_account}/ai/run/@cf/cloudflare/clef' if clef_account else None
+        self.clef_token = clef_token
 
     def consult(self, intent, sku):
         return self.hybrid(intent, sku, consultation=True)
@@ -260,16 +266,30 @@ class HybridEngine:
         state = {'intent': intent, 'product': {key: record[key] for key in ('name', 'price', 'currency') if key in record}, 'quantity': quantity, 'days': days, 'knowledge': list(self.kb_urls)}
         usage = {}
         try:
-            decision = invoke(post_jev if self.transport is post else self.transport, usage, "jev", SYSTEM_ONE_TOKENS, 'https://api.typesafe.ai/v1/systemone', {'model': self.jev_model, 'state': state, 'questions': QUESTIONS}, self.jev_key)
+            jev_transport = self.transport
+            if self.transport is post and (os.name == 'nt' or not self.clef_url):
+                jev_transport = post_jev
+            decision = invoke(jev_transport, usage, "jev", SYSTEM_ONE_TOKENS, 'https://api.typesafe.ai/v1/systemone', {'model': self.jev_model, 'state': state, 'questions': QUESTIONS}, self.jev_key)
             route = decision['answers']['route']['choice']
             probability = decision['answers']['route'].get('probabilities', {}).get(route, 0)
             if route not in ('billing', 'technical') or probability < .85:
                 return {'text': '', 'mode': 'local_required', 'verified_model': False, 'usage': usage}
             instruction = CONSULTATION_PROMPT if consultation else "Answer only using supplied public product facts. Do not invent order, license or customer data."
+            if self.clef_url:
+                def classify(url, payload, token):
+                    return self.transport(url, payload, token)['result']
+                review = invoke(classify, usage, "clef", SYSTEM_ONE_TOKENS, self.clef_url,
+                                {'state': state, 'questions': QUESTIONS}, self.clef_token)
+                if review['answers']['route']['choice'] != route:
+                    return {'text': '', 'mode': 'local_required', 'verified_model': False, 'usage': usage}
+                instruction += ' Не добавляй приглашение обращаться к менеджеру с дальнейшими вопросами.'
             if self.cloud_generator:
                 response = invoke(self.cloud_generator, usage, 'cloud', CHAT_TOKENS, instruction, state)
             else:
-                response = invoke(self.transport, usage, "cloud", CHAT_TOKENS, self.cloud_url, {'model': self.cloud_model, 'messages': [{'role': 'system', 'content': instruction}, {'role': 'user', 'content': json.dumps(state, ensure_ascii=False)}], 'max_tokens': 256}, self.cloud_key)
+                payload = {'model': self.cloud_model, 'messages': [{'role': 'system', 'content': instruction}, {'role': 'user', 'content': json.dumps(state, ensure_ascii=False)}], 'max_tokens': 256}
+                if self.cloud_model == 'qwen/qwen3.6-35b-a3b':
+                    payload.update(max_tokens=4096, temperature=0, reasoning={'enabled': False})
+                response = invoke(self.transport, usage, "cloud", CHAT_TOKENS, self.cloud_url, payload, self.cloud_key)
             answer = response['choices'][0]['message']['content']
             if not isinstance(answer, str) or not answer.strip():
                 raise ValueError('empty answer')

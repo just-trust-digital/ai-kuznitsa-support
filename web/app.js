@@ -36,7 +36,7 @@ function clientContext() {
   }
   return clientContexts.get(key);
 }
-let buyerMode = 'local';
+let buyerMode;
 const storefront = () => role==='buyer' || role==='guest';
 function guestToken() {
   let value=sessionStorage.getItem('softline-guest');
@@ -148,7 +148,7 @@ async function roleState(nextRole) {
   telegramEnabled ||= Boolean(next.telegram);
   return next;
 }
-async function loadState() { state = await roleState(role); }
+async function loadState() { state = await roleState(role); buyerMode ??= state.default_model_mode || 'local'; }
 async function loadCatalog(query, page) {
   const data = await request('/api/action',{role,action:'search',payload:{query,by_product:true,page,limit:8}});
   selectedOffer='';

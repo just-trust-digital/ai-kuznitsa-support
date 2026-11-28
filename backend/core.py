@@ -469,6 +469,7 @@ class Store:
             if role == "buyer":
                 feed.pop("changes", None)
             return dict(role=role, buyer_id=buyer_id, feed=feed, offers=self._search(db, state),
+                        default_model_mode=self._default_model_mode(),
                         catalog=catalog[:8], catalog_has_more=len(catalog) > 8,
                         licenses=demo_account.licenses(buyer_id) if role == "buyer" else [],
                         manager2_active=scope.startswith("jury") and any(
@@ -568,12 +569,16 @@ class Store:
             self.storage.save(db, scope, state)
             return self._result_view(role, result)
 
+    def _default_model_mode(self):
+        hybrid = getattr(self, 'runtime_config', {}).get('hybrid', {})
+        return 'hybrid' if self.hybrid_engine and hybrid.get('default_for_chat') else 'local'
+
     def _prepare_model(self, role, action, payload, scope, request, fingerprint):
         chat = role == "buyer" and action == "message"
         copilot = role != "buyer" and action == "copilot"
         if not chat and not copilot:
             return None
-        mode = payload.get("mode", "local" if chat else "rules")
+        mode = payload.get("mode", self._default_model_mode() if chat else "rules")
         if mode not in ("rules", "local", "hybrid"):
             raise ValueError("Неизвестный режим ответа")
         if mode == "rules" or (chat and (payload.get("starter") or payload.get("reference"))):
