@@ -239,6 +239,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bind", default="127.0.0.1", help="Listen address. Use a private interface behind a reverse proxy.")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--runtime", type=Path, default=ROOT / "private" / "runtime")
     parser.add_argument("--access-dir", type=Path, default=os.environ.get("SUPPORT_ACCESS_DIR") or ROOT / "private" / "runtime",
@@ -251,12 +252,12 @@ def main():
         return
     feed = args.materials / "Mindbox.yml.gz.xml"
     corpus = args.materials / "support-chats.zip"
-    with SupportServer(("127.0.0.1", args.port), Handler) as server:
+    with SupportServer((args.bind, args.port), Handler) as server:
         server.credentials = credentials
         server.store = build_store(args.runtime / "stand.sqlite3", feed if feed.is_file() else None,
                                    corpus if corpus.is_file() else None, args.runtime)
         stop_forum = start_forum(server.store, args.runtime)
-        print(f"Support stand: http://127.0.0.1:{args.port}/?utm_source=jtd_dev", flush=True)
+        print(f"Support stand: http://{args.bind}:{args.port}/?utm_source=jtd_dev", flush=True)
         try:
             server.serve_forever()
         finally:
