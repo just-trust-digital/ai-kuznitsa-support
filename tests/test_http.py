@@ -58,7 +58,9 @@ class TestStandAccess(unittest.TestCase):
         notifications.receive({**message, "chat": {"id": 701, "type": "group"}}, 1)
         self.assertEqual(sent, [])
         notifications.receive(message, 2)
-        code = sent.pop()["text"].splitlines()[2]
+        pairing_message = sent.pop()
+        self.assertFalse(pairing_message.get("protect_content", False))
+        code = pairing_message["text"].splitlines()[2]
         connect = {"action": "telegram_connect", "payload": {"code": code}, "role": "manager1"}
         self.assertEqual(self.call("/api/action", "buyer", connect, browser_session=session)[0], 403)
         self.assertEqual(self.call("/api/action", "manager1", connect)[0], 403)
